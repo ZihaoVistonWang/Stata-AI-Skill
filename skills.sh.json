@@ -5,7 +5,7 @@
     {
       "title": "Stata",
       "description": "Skills for running Stata through the native AI Skill service.",
-      "skills": ["stata-all-in-one-skill"]
+      "skills": ["stata-ai-skill"]
     }
   ]
 }

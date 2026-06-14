@@ -19,7 +19,7 @@ skill definition:
 
 ```text
 skills/
-  stata-all-in-one-skill/
+  stata-ai-skill/
     SKILL.md
     bin/
       macos/
@@ -33,11 +33,11 @@ skills/
 ```
 
 Agents should resolve the executable from
-`skills/stata-all-in-one-skill/bin/<platform>/` first. Use `macos-arm64` for
+`skills/stata-ai-skill/bin/<platform>/` first. Use `macos-arm64` for
 Apple Silicon Macs, `windows` for Windows x64, and `windows-arm64` for Windows
 ARM64. Intel Mac is not supported; agents should detect `x86_64` macOS and
 report that the skill is not compatible.
-`skills/stata-all-in-one-skill/bin/macos/` remains a legacy Apple Silicon
+`skills/stata-ai-skill/bin/macos/` remains a legacy Apple Silicon
 fallback. Cargo's `target/release/` directory is only a development build
 output, not the runtime contract.
 
@@ -48,12 +48,12 @@ cargo run -p xtask -- dist
 ```
 
 This runs a release build and copies the executable into
-`skills/stata-all-in-one-skill/bin/<platform>/`.
+`skills/stata-ai-skill/bin/<platform>/`.
 
 ## Install With skills.sh
 
 ```bash
-npx skills add ZihaoVistonWang/Stata-AI-Skill --skill stata-all-in-one-skill
+npx skills add ZihaoVistonWang/Stata-AI-Skill --skill stata-ai-skill
 ```
 
 Users do not manually install or edit configuration. An AI agent can launch the
@@ -63,7 +63,7 @@ needed, write config via CLI, and call the HTTP API.
 ## Quick Start
 
 ```bash
-./skills/stata-all-in-one-skill/bin/macos-arm64/stata-ai-skill serve
+./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill serve
 curl http://127.0.0.1:19522/status
 ```
 
@@ -71,15 +71,15 @@ If Stata cannot be found, `/status` returns `needsConfiguration: true`. The
 agent should ask the user where the Stata app/program is installed and run:
 
 ```bash
-./skills/stata-all-in-one-skill/bin/macos-arm64/stata-ai-skill config set --stata-path "/Applications/StataMP.app"
-./skills/stata-all-in-one-skill/bin/macos-arm64/stata-ai-skill serve
+./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill config set --stata-path "/Applications/StataMP.app"
+./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill serve
 ```
 
 Windows example:
 
 ```powershell
-.\skills\stata-all-in-one-skill\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
-.\skills\stata-all-in-one-skill\bin\windows\stata-ai-skill.exe serve
+.\skills\stata-ai-skill\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
+.\skills\stata-ai-skill\bin\windows\stata-ai-skill.exe serve
 ```
 
 If Stata is found but the license file is missing, `/status` returns

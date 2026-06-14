@@ -46,7 +46,7 @@ fn dist() -> Result<()> {
     let source = root.join("target").join("release").join(exe_name);
     let dest_dir = root
         .join("skills")
-        .join("stata-all-in-one-skill")
+        .join("stata-ai-skill")
         .join("bin")
         .join(platform_dir);
     let dest = dest_dir.join(exe_name);
