@@ -14,6 +14,50 @@ and preserves the AI Skill HTTP workflow without requiring VS Code at runtime.
 Use the native localhost service at `http://127.0.0.1:19522` to run Stata.
 Do not import internal modules. The stable interface is HTTP.
 
+## Locate The Executable
+
+Agents must resolve the executable from this skill directory before using PATH
+or build outputs. Do not require the user to know Cargo's `target/release`
+directory.
+
+Expected packaged layout:
+
+```text
+stata-all-in-one-skill/
+  SKILL.md
+  bin/
+    macos/
+      stata-ai-skill
+    windows/
+      stata-ai-skill.exe
+```
+
+Resolution order:
+
+1. If `STATA_AI_SKILL_BIN` is set, use that exact executable path.
+2. macOS: use `<this-skill-directory>/bin/macos/stata-ai-skill`.
+3. Windows: use `<this-skill-directory>\bin\windows\stata-ai-skill.exe`.
+4. Fallback only if packaged binary is missing: use `stata-ai-skill` from PATH.
+
+For development builds, refresh the packaged executable with:
+
+```bash
+cargo run -p xtask -- dist
+```
+
+When writing commands below, replace `stata-ai-skill` with the resolved
+executable path. Examples:
+
+```bash
+# macOS, from the skill directory
+./bin/macos/stata-ai-skill serve
+```
+
+```powershell
+# Windows, from the skill directory
+.\bin\windows\stata-ai-skill.exe serve
+```
+
 ## Agent Workflow
 
 1. Check whether the service is running:
@@ -28,12 +72,25 @@ curl -s --connect-timeout 2 http://127.0.0.1:19522/status 2>/dev/null || echo "O
 stata-ai-skill serve
 ```
 
+Use the resolved executable path from "Locate The Executable"; the bare command
+above is only shorthand.
+
 3. If `/status` returns `needsConfiguration: true`, ask the user where the Stata
 app/program is installed. Avoid saying only "Stata path" because some users do
 not know what a path is. Then configure it:
 
 ```bash
 stata-ai-skill config set --stata-path "<USER_PROVIDED_STATA_PATH>"
+```
+
+Again, use the resolved executable path. For example:
+
+```bash
+./bin/macos/stata-ai-skill config set --stata-path "/Applications/StataNow/StataMP.app"
+```
+
+```powershell
+.\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18"
 ```
 
 User-facing wording:

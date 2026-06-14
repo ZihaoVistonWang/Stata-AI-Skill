@@ -10,6 +10,30 @@ The distributed artifact is a single native executable:
 - macOS: `stata-ai-skill` (Mach-O executable)
 - Windows: `stata-ai-skill.exe` (PE executable)
 
+For agent use, package the executable next to the skill definition:
+
+```text
+skill/
+  SKILL.md
+  bin/
+    macos/
+      stata-ai-skill
+    windows/
+      stata-ai-skill.exe
+```
+
+Agents should resolve the executable from `skill/bin/<platform>/` first. Cargo's
+`target/release/` directory is only a development build output, not the runtime
+contract.
+
+To build and refresh the packaged binary for the current platform, run:
+
+```bash
+cargo run -p xtask -- dist
+```
+
+This runs a release build and copies the executable into `skill/bin/<platform>/`.
+
 Users do not manually install or edit configuration. An AI agent can launch the
 service, check status, ask where the Stata app/program is installed only when
 needed, write config via CLI, and call the HTTP API.
@@ -17,7 +41,7 @@ needed, write config via CLI, and call the HTTP API.
 ## Quick Start
 
 ```bash
-stata-ai-skill serve
+./skill/bin/macos/stata-ai-skill serve
 curl http://127.0.0.1:19522/status
 ```
 
@@ -25,15 +49,15 @@ If Stata cannot be found, `/status` returns `needsConfiguration: true`. The
 agent should ask the user where the Stata app/program is installed and run:
 
 ```bash
-stata-ai-skill config set --stata-path "/Applications/StataMP.app"
-stata-ai-skill serve
+./skill/bin/macos/stata-ai-skill config set --stata-path "/Applications/StataMP.app"
+./skill/bin/macos/stata-ai-skill serve
 ```
 
 Windows example:
 
 ```powershell
-.\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
-.\stata-ai-skill.exe serve
+.\skill\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
+.\skill\bin\windows\stata-ai-skill.exe serve
 ```
 
 If Stata is found but the license file is missing, `/status` returns
@@ -99,5 +123,5 @@ Install Rust on macOS with Homebrew:
 xcode-select --install
 brew update
 brew install rust
-cargo build
+cargo run -p xtask -- dist
 ```
