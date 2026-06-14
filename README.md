@@ -1,5 +1,7 @@
 # Stata AI Skill Native Service
 
+[![skills.sh](https://skills.sh/b/ZihaoVistonWang/Stata-AI-Skill)](https://skills.sh/ZihaoVistonWang/Stata-AI-Skill)
+
 Native localhost HTTP service that lets AI agents run Stata without VS Code,
 Node.js, or Python on the user side.
 

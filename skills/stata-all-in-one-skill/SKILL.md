@@ -1,6 +1,6 @@
 ---
 name: stata-all-in-one-skill
-description: Run Stata code through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summaries, tests, or .do/.dta workflows. No VS Code, Node.js, or Python runtime is required on the user side.
+description: Run Stata code and statistical analysis through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, or econometrics workflows. No VS Code, Node.js, or Python runtime is required on the user side.
 ---
 
 # Stata AI Skill
