@@ -384,24 +384,47 @@ fn app_name_without_ext(path: &Path) -> String {
 #[cfg(target_os = "windows")]
 fn scan_common_paths() -> Vec<PathBuf> {
     let mut out = Vec::new();
-    for root in [
-        env::var_os("ProgramFiles"),
-        env::var_os("ProgramFiles(x86)"),
-    ]
-    .into_iter()
-    .flatten()
-    .map(PathBuf::from)
-    {
-        if let Ok(entries) = fs::read_dir(root) {
+
+    let drives = ('A'..='Z')
+        .map(|d| PathBuf::from(format!("{}:\\", d)))
+        .filter(|p| {
+            // is_dir is fast on Windows for non-existent drives;
+            // only call when the path actually exists to avoid
+            // unnecessary stat calls on removable / network drives.
+            p.exists()
+        })
+        .collect::<Vec<_>>();
+
+    for drive in &drives {
+        // drive:\Program Files\Stata*  (catches C:\Program Files\Stata18, etc.)
+        for prog_dir in ["Program Files", "Program Files (x86)"] {
+            let pf = drive.join(prog_dir);
+            if pf.is_dir() {
+                if let Ok(entries) = fs::read_dir(&pf) {
+                    for entry in entries.flatten() {
+                        let name = entry
+                            .file_name()
+                            .to_str()
+                            .unwrap_or("")
+                            .to_ascii_lowercase();
+                        if name.starts_with("stata") {
+                            out.extend(windows_libraries_in(&entry.path()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // drive root: drive:\Stata*  (catches D:\Stata18, etc.)
+        if let Ok(entries) = fs::read_dir(drive) {
             for entry in entries.flatten() {
-                let path = entry.path();
-                let name = path
+                let name = entry
                     .file_name()
-                    .and_then(|v| v.to_str())
+                    .to_str()
                     .unwrap_or("")
                     .to_ascii_lowercase();
-                if name.starts_with("stata") {
-                    out.extend(windows_libraries_in(&path));
+                if name.starts_with("stata") && entry.path().is_dir() {
+                    out.extend(windows_libraries_in(&entry.path()));
                 }
             }
         }
