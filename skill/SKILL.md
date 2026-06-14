@@ -2,7 +2,7 @@
 name: stata-all-in-one-skill
 version: 202606130001
 description: Run Stata code through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summaries, tests, or .do/.dta workflows. No VS Code, Node.js, or Python runtime is required on the user side.
-compatibility: Requires macOS or Windows, the native stata-ai-skill executable, and a locally installed/licensed Stata. If automatic Stata discovery fails, ask the user where the Stata app/program is installed and configure it with the executable CLI.
+compatibility: Requires Apple Silicon macOS or Windows, the native stata-ai-skill executable, and a locally installed/licensed Stata. Intel Mac is not supported. If automatic Stata discovery fails, ask the user where the Stata app/program is installed and configure it with the executable CLI.
 ---
 
 # Stata AI Skill
@@ -27,7 +27,9 @@ stata-all-in-one-skill/
   SKILL.md
   bin/
     macos/
-      stata-ai-skill
+      stata-ai-skill            (legacy fallback)
+    macos-arm64/
+      stata-ai-skill            (Apple Silicon)
     windows/
       stata-ai-skill.exe          (x64)
     windows-arm64/
@@ -37,10 +39,25 @@ stata-all-in-one-skill/
 Resolution order:
 
 1. If `STATA_AI_SKILL_BIN` is set, use that exact executable path.
-2. macOS: use `<this-skill-directory>/bin/macos/stata-ai-skill`.
-3. Windows x64: use `<this-skill-directory>\bin\windows\stata-ai-skill.exe`.
-4. Windows ARM64: use `<this-skill-directory>\bin\windows-arm64\stata-ai-skill.exe`.
-5. Fallback only if packaged binary is missing: use `stata-ai-skill` from PATH.
+2. macOS Apple Silicon: use `<this-skill-directory>/bin/macos-arm64/stata-ai-skill`.
+3. macOS Intel (`x86_64`): stop and tell the user this skill does not support Intel Mac.
+4. macOS Apple Silicon fallback: use `<this-skill-directory>/bin/macos/stata-ai-skill`.
+5. Windows x64: use `<this-skill-directory>\bin\windows\stata-ai-skill.exe`.
+6. Windows ARM64: use `<this-skill-directory>\bin\windows-arm64\stata-ai-skill.exe`.
+7. Fallback only if packaged binary is missing on a supported platform: use `stata-ai-skill` from PATH.
+
+To detect macOS architecture:
+
+```bash
+case "$(uname -m)" in
+  arm64) exe="./bin/macos-arm64/stata-ai-skill" ;;
+  x86_64)
+    echo "Stata AI Skill does not support Intel Mac."
+    exit 1
+    ;;
+  *) exe="./bin/macos/stata-ai-skill" ;;
+esac
+```
 
 To detect Windows architecture from PowerShell:
 
@@ -63,7 +80,7 @@ executable path. Examples:
 
 ```bash
 # macOS, from the skill directory
-./bin/macos/stata-ai-skill serve
+./bin/macos-arm64/stata-ai-skill serve
 ```
 
 ```powershell

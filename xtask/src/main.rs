@@ -24,6 +24,13 @@ fn run() -> Result<()> {
 }
 
 fn dist() -> Result<()> {
+    if cfg!(target_os = "macos") && !cfg!(target_arch = "aarch64") {
+        return Err(
+            "Intel Mac is not supported. macOS packaging is only available for Apple Silicon."
+                .to_string(),
+        );
+    }
+
     let root = workspace_root()?;
     let cargo = env::var("CARGO").unwrap_or_else(|_| "cargo".to_string());
     let status = Command::new(cargo)
@@ -77,9 +84,13 @@ fn workspace_root() -> Result<PathBuf> {
 
 fn packaged_binary_name() -> (&'static str, &'static str) {
     if cfg!(target_os = "windows") {
-        ("windows", "stata-ai-skill.exe")
+        if cfg!(target_arch = "aarch64") {
+            ("windows-arm64", "stata-ai-skill.exe")
+        } else {
+            ("windows", "stata-ai-skill.exe")
+        }
     } else if cfg!(target_os = "macos") {
-        ("macos", "stata-ai-skill")
+        ("macos-arm64", "stata-ai-skill")
     } else {
         ("unix", "stata-ai-skill")
     }

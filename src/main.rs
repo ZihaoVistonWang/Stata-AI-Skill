@@ -25,6 +25,13 @@ fn main() {
 }
 
 fn run() -> Result<()> {
+    if cfg!(target_os = "macos") && cfg!(target_arch = "x86_64") {
+        return Err(
+            "Stata AI Skill native service does not support Intel Mac. This skill currently supports Apple Silicon macOS and Windows x64/ARM64."
+                .to_string(),
+        );
+    }
+
     let args: Vec<String> = env::args().collect();
     let paths = AppPaths::new()?;
     paths.ensure()?;
