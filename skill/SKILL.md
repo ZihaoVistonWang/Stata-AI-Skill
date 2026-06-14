@@ -93,6 +93,15 @@ Again, use the resolved executable path. For example:
 .\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18"
 ```
 
+**Important:** After running `config set`, the running service does NOT pick up
+the new configuration. You must shut down and restart the service:
+
+```bash
+curl -s -X POST http://127.0.0.1:19522/shutdown
+# then start again:
+./bin/macos/stata-ai-skill serve
+```
+
 User-facing wording:
 
 - macOS: "Open Finder > Applications, find the Stata app icon, and tell me its
@@ -126,6 +135,39 @@ Common license locations:
 
 ## Execute
 
+### PowerShell Curl Notes
+
+In PowerShell, `curl.exe -d` with a JSON body containing double quotes is
+often mangled because PowerShell intercepts the quotes before they reach curl.
+The double quotes inside `-d '{"code":"..."}'` get stripped or misinterpreted.
+
+**Do NOT use inline JSON with curl.exe in PowerShell.** Instead, always write
+the JSON body to a temporary file and use `--data-binary @file`:
+
+```powershell
+# Correct approach — write JSON to a temp file first
+$body = '{"code":"display 2+2"}'
+$body | Out-File -FilePath "$env:TEMP\stata_body.json" -Encoding utf8 -NoNewline
+curl.exe -s -X POST http://127.0.0.1:19522/execute `
+  -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\stata_body.json"
+```
+
+This also avoids encoding issues with `Invoke-RestMethod` in PowerShell 5.1.
+
+For multi-line Stata code, use a literal `\n` (backslash + n) inside the JSON
+string — the JSON parser will convert it to an actual newline:
+
+```powershell
+$body = '{"code":"sysuse auto, clear\nsummarize price mpg"}'
+$body | Out-File -FilePath "$env:TEMP\stata_body.json" -Encoding utf8 -NoNewline
+curl.exe -s -X POST http://127.0.0.1:19522/execute `
+  -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\stata_body.json"
+```
+
+On macOS/Linux (bash/zsh), inline JSON works as expected:
+
 ```bash
 curl -s -X POST http://127.0.0.1:19522/execute \
   -H "Content-Type: application/json" \
@@ -151,6 +193,29 @@ curl -s -X POST http://127.0.0.1:19522/execute \
   -H "Content-Type: application/json" \
   -d '{"code":"bootstrap r(mean), reps(1000): summarize price", "timeout": 300}'
 ```
+
+Response for a timed-out execution returns HTTP 408 with:
+
+```json
+{"success":false,"returnCode":-1,"output":"Execution timed out after 3s","error":"Execution timed out after 3s","graphs":[]}
+```
+
+### Session Recovery After Timeout
+
+After a timeout kills execution, the Stata session may briefly be in a
+recovering state. The **first** execution immediately after a timeout may
+return a stale timeout error even though Stata completed. Always verify by
+running a trivial command after timeout:
+
+```bash
+curl -s -X POST http://127.0.0.1:19522/execute \
+  -H "Content-Type: application/json" \
+  -d '{"code":"display 123"}'
+```
+
+If it returns `success: true`, the session is healthy. If it returns another
+timeout error, check `/status` and retry once more. The service itself does
+not crash on timeout.
 
 ## Break And Shutdown
 
