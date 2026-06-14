@@ -36,6 +36,15 @@ Windows example:
 .\stata-ai-skill.exe serve
 ```
 
+If Stata is found but the license file is missing, `/status` returns
+`needsLicense: true`, `missing: "stata_license"`, and the expected `licensePath`.
+Ask the user to confirm that Stata is licensed and that `stata.lic` or
+`STATA.lic` exists in the Stata installation directory. The filename is checked
+case-insensitively. Examples:
+
+- macOS: `/Applications/StataNow/stata.lic`
+- Windows: `C:\Program Files\Stata18\STATA.lic`
+
 User-facing wording for agents:
 
 - macOS: "Open Finder > Applications, find the Stata app icon, and tell me its

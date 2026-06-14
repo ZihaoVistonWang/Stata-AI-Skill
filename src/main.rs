@@ -222,7 +222,10 @@ fn parse_quoted_value(line: &str) -> Option<String> {
 #[derive(Clone, Debug)]
 struct Discovery {
     library_path: Option<PathBuf>,
+    license_path: Option<PathBuf>,
+    license_found: bool,
     needs_configuration: bool,
+    needs_license: bool,
     message: String,
     examples: Vec<String>,
     candidates: Vec<PathBuf>,
@@ -235,17 +238,25 @@ fn discover_stata(configured: Option<&Path>) -> Discovery {
     }
     candidates.extend(scan_common_paths());
     let library_path = candidates.iter().find(|p| p.exists()).cloned();
+    let license_path = library_path.as_deref().and_then(expected_license_path);
+    let license_found = license_path.as_ref().map(|p| p.exists()).unwrap_or(false);
     let needs_configuration = library_path.is_none();
+    let needs_license = library_path.is_some() && !license_found;
     Discovery {
         library_path,
+        license_path,
+        license_found,
         needs_configuration,
+        needs_license,
         message: if needs_configuration {
             format!(
                 "Stata was not found automatically. Ask the user where the Stata app/program is installed. Examples: {}. Then run `stata-ai-skill config set --stata-path <path>`.",
                 example_paths().join(" or ")
             )
+        } else if needs_license {
+            "Stata was found, but the license file stata.lic / STATA.lic was not found in the expected Stata installation directory. Ask the user to confirm Stata is licensed and that the license file exists next to the Stata installation.".to_string()
         } else {
-            "Stata library found.".to_string()
+            "Stata library and license file found.".to_string()
         },
         examples: example_paths(),
         candidates,
@@ -453,7 +464,19 @@ struct AppState {
 
 fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
     let discovery = discover_stata(config.stata_path.as_deref());
-    let (session, init_error) = if let Some(lib) = &discovery.library_path {
+    let (session, init_error) = if discovery.needs_license {
+        let license_path = discovery
+            .license_path
+            .as_ref()
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "the expected Stata installation directory".to_string());
+        (
+            None,
+            Some(format!(
+                "Stata license file not found at {license_path}. Please make sure Stata is installed and licensed."
+            )),
+        )
+    } else if let Some(lib) = &discovery.library_path {
         match StataSession::new(lib) {
             Ok(session) => (Some(Arc::new(session)), None),
             Err(err) => (None, Some(err)),
@@ -551,27 +574,46 @@ fn status_json(state: &AppState) -> String {
         .as_ref()
         .map(|s| s.is_active())
         .unwrap_or(false);
-    let needs_configuration = state.discovery.needs_configuration || state.init_error.is_some();
+    let needs_configuration = state.discovery.needs_configuration;
+    let needs_license = state.discovery.needs_license;
     let message = if session_active {
         if state.busy.load(Ordering::SeqCst) {
             "Stata is busy executing".to_string()
         } else {
             "Stata session is active".to_string()
         }
+    } else if needs_license {
+        state.discovery.message.clone()
     } else if let Some(err) = &state.init_error {
         format!("Stata initialization failed: {err}. Ask the user where the Stata app/program is installed, then reconfigure with `stata-ai-skill config set --stata-path <path>`.")
     } else {
         state.discovery.message.clone()
     };
     format!(
-        "{{\"service\":\"{}\",\"skillVersion\":\"{}\",\"status\":\"{}\",\"sessionActive\":{},\"busy\":{},\"needsConfiguration\":{},\"missing\":{},\"message\":\"{}\",\"examplePaths\":{},\"detectedCandidates\":{},\"initError\":{}}}",
+        "{{\"service\":\"{}\",\"skillVersion\":\"{}\",\"status\":\"{}\",\"sessionActive\":{},\"busy\":{},\"needsConfiguration\":{},\"needsLicense\":{},\"licenseFound\":{},\"licensePath\":{},\"missing\":{},\"message\":\"{}\",\"examplePaths\":{},\"detectedCandidates\":{},\"initError\":{}}}",
         SERVICE_NAME,
         SKILL_VERSION,
         if state.shutting_down.load(Ordering::SeqCst) { "shutting_down" } else { "running" },
         session_active,
         state.busy.load(Ordering::SeqCst),
         needs_configuration,
-        if needs_configuration { "\"stata_library_path\"" } else { "null" },
+        needs_license,
+        state.discovery.license_found,
+        state
+            .discovery
+            .license_path
+            .as_ref()
+            .map(|p| format!("\"{}\"", json_escape(&p.to_string_lossy())))
+            .unwrap_or_else(|| "null".to_string()),
+        if needs_configuration {
+            "\"stata_library_path\""
+        } else if needs_license {
+            "\"stata_license\""
+        } else if state.init_error.is_some() {
+            "\"stata_initialization\""
+        } else {
+            "null"
+        },
         json_escape(&message),
         json_string_array(&state.discovery.examples),
         json_path_array(&state.discovery.candidates),
@@ -1202,6 +1244,24 @@ fn derive_stata_home(library_path: &Path) -> Option<PathBuf> {
     {
         library_path.parent().map(Path::to_path_buf)
     }
+}
+
+fn expected_license_path(library_path: &Path) -> Option<PathBuf> {
+    let home = derive_stata_home(library_path)?;
+    if let Ok(entries) = fs::read_dir(&home) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let is_license = path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(|name| name.eq_ignore_ascii_case("stata.lic"))
+                .unwrap_or(false);
+            if is_license {
+                return Some(path);
+            }
+        }
+    }
+    Some(home.join("stata.lic"))
 }
 
 fn init_args() -> Vec<CString> {

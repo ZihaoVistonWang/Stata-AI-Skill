@@ -55,6 +55,18 @@ Accepted paths include the Stata app/exe, install directory, or shared library:
 
 4. Recheck `/status`. If `sessionActive: true`, call `/execute`.
 
+If `/status` returns `needsLicense: true` or `missing: "stata_license"`, Stata
+was found but the license file was not found. Tell the user:
+
+"Stata is installed, but the service cannot find the Stata license file
+`stata.lic` / `STATA.lic`. Please open Stata once to confirm it is licensed, or
+check that the license file exists in the Stata installation folder."
+
+Common license locations:
+
+- macOS: `/Applications/StataNow/stata.lic`
+- Windows: `C:\Program Files\Stata18\STATA.lic`
+
 ## Execute
 
 ```bash
