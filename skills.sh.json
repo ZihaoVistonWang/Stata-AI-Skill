@@ -1,0 +1,11 @@
+{
+  "$schema": "https://skills.sh/schemas/skills.sh.schema.json",
+  "notGrouped": "bottom",
+  "groupings": [
+    {
+      "title": "Stata",
+      "description": "Skills for running Stata through the native AI Skill service.",
+      "skills": ["stata-all-in-one-skill"]
+    }
+  ]
+}

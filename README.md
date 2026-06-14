@@ -12,28 +12,32 @@ The distributed artifact is a single native executable:
 
 macOS support is Apple Silicon only. Intel Mac is not supported.
 
-For agent use, package the executable next to the skill definition:
+For agent use and skills.sh publishing, package the executable next to the
+skill definition:
 
 ```text
-skill/
-  SKILL.md
-  bin/
-    macos/
-      stata-ai-skill
-    macos-arm64/
-      stata-ai-skill
-    windows/
-      stata-ai-skill.exe
-    windows-arm64/
-      stata-ai-skill.exe
+skills/
+  stata-all-in-one-skill/
+    SKILL.md
+    bin/
+      macos/
+        stata-ai-skill
+      macos-arm64/
+        stata-ai-skill
+      windows/
+        stata-ai-skill.exe
+      windows-arm64/
+        stata-ai-skill.exe
 ```
 
-Agents should resolve the executable from `skill/bin/<platform>/` first. Use
-`macos-arm64` for Apple Silicon Macs, `windows` for Windows x64, and
-`windows-arm64` for Windows ARM64. Intel Mac is not supported; agents should
-detect `x86_64` macOS and report that the skill is not compatible. `skill/bin/macos/`
-remains a legacy Apple Silicon fallback. Cargo's `target/release/` directory is
-only a development build output, not the runtime contract.
+Agents should resolve the executable from
+`skills/stata-all-in-one-skill/bin/<platform>/` first. Use `macos-arm64` for
+Apple Silicon Macs, `windows` for Windows x64, and `windows-arm64` for Windows
+ARM64. Intel Mac is not supported; agents should detect `x86_64` macOS and
+report that the skill is not compatible.
+`skills/stata-all-in-one-skill/bin/macos/` remains a legacy Apple Silicon
+fallback. Cargo's `target/release/` directory is only a development build
+output, not the runtime contract.
 
 To build and refresh the packaged binary for the current platform, run:
 
@@ -41,7 +45,14 @@ To build and refresh the packaged binary for the current platform, run:
 cargo run -p xtask -- dist
 ```
 
-This runs a release build and copies the executable into `skill/bin/<platform>/`.
+This runs a release build and copies the executable into
+`skills/stata-all-in-one-skill/bin/<platform>/`.
+
+## Install With skills.sh
+
+```bash
+npx skills add ZihaoVistonWang/Stata-AI-Skill --skill stata-all-in-one-skill
+```
 
 Users do not manually install or edit configuration. An AI agent can launch the
 service, check status, ask where the Stata app/program is installed only when
@@ -50,7 +61,7 @@ needed, write config via CLI, and call the HTTP API.
 ## Quick Start
 
 ```bash
-./skill/bin/macos-arm64/stata-ai-skill serve
+./skills/stata-all-in-one-skill/bin/macos-arm64/stata-ai-skill serve
 curl http://127.0.0.1:19522/status
 ```
 
@@ -58,15 +69,15 @@ If Stata cannot be found, `/status` returns `needsConfiguration: true`. The
 agent should ask the user where the Stata app/program is installed and run:
 
 ```bash
-./skill/bin/macos-arm64/stata-ai-skill config set --stata-path "/Applications/StataMP.app"
-./skill/bin/macos-arm64/stata-ai-skill serve
+./skills/stata-all-in-one-skill/bin/macos-arm64/stata-ai-skill config set --stata-path "/Applications/StataMP.app"
+./skills/stata-all-in-one-skill/bin/macos-arm64/stata-ai-skill serve
 ```
 
 Windows example:
 
 ```powershell
-.\skill\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
-.\skill\bin\windows\stata-ai-skill.exe serve
+.\skills\stata-all-in-one-skill\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
+.\skills\stata-all-in-one-skill\bin\windows\stata-ai-skill.exe serve
 ```
 
 If Stata is found but the license file is missing, `/status` returns

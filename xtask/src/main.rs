@@ -44,7 +44,11 @@ fn dist() -> Result<()> {
 
     let (platform_dir, exe_name) = packaged_binary_name();
     let source = root.join("target").join("release").join(exe_name);
-    let dest_dir = root.join("skill").join("bin").join(platform_dir);
+    let dest_dir = root
+        .join("skills")
+        .join("stata-all-in-one-skill")
+        .join("bin")
+        .join(platform_dir);
     let dest = dest_dir.join(exe_name);
 
     fs::create_dir_all(&dest_dir)

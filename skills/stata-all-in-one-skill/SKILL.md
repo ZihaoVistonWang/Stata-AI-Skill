@@ -1,11 +1,14 @@
 ---
 name: stata-all-in-one-skill
-version: 202606130001
 description: Run Stata code through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summaries, tests, or .do/.dta workflows. No VS Code, Node.js, or Python runtime is required on the user side.
-compatibility: Requires Apple Silicon macOS or Windows, the native stata-ai-skill executable, and a locally installed/licensed Stata. Intel Mac is not supported. If automatic Stata discovery fails, ask the user where the Stata app/program is installed and configure it with the executable CLI.
 ---
 
 # Stata AI Skill
+
+Requires Apple Silicon macOS or Windows, the native `stata-ai-skill`
+executable, and a locally installed/licensed Stata. Intel Mac is not
+supported. If automatic Stata discovery fails, ask the user where the Stata
+app/program is installed and configure it with the executable CLI.
 
 This native service is extracted from
 [ZihaoVistonWang/stata-all-in-one](https://github.com/ZihaoVistonWang/stata-all-in-one)
