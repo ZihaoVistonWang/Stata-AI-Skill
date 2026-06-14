@@ -29,15 +29,28 @@ stata-all-in-one-skill/
     macos/
       stata-ai-skill
     windows/
-      stata-ai-skill.exe
+      stata-ai-skill.exe          (x64)
+    windows-arm64/
+      stata-ai-skill.exe          (ARM64)
 ```
 
 Resolution order:
 
 1. If `STATA_AI_SKILL_BIN` is set, use that exact executable path.
 2. macOS: use `<this-skill-directory>/bin/macos/stata-ai-skill`.
-3. Windows: use `<this-skill-directory>\bin\windows\stata-ai-skill.exe`.
-4. Fallback only if packaged binary is missing: use `stata-ai-skill` from PATH.
+3. Windows x64: use `<this-skill-directory>\bin\windows\stata-ai-skill.exe`.
+4. Windows ARM64: use `<this-skill-directory>\bin\windows-arm64\stata-ai-skill.exe`.
+5. Fallback only if packaged binary is missing: use `stata-ai-skill` from PATH.
+
+To detect Windows architecture from PowerShell:
+
+```powershell
+if ($env:PROCESSOR_ARCHITECTURE -eq "ARM64") {
+    $exe = ".\bin\windows-arm64\stata-ai-skill.exe"
+} else {
+    $exe = ".\bin\windows\stata-ai-skill.exe"
+}
+```
 
 For development builds, refresh the packaged executable with:
 
