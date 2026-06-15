@@ -285,24 +285,42 @@ is installed:
 which lianxh
 ```
 
-If Stata reports "command lianxh not found", use the host agent's interactive
-prompt mechanism to present a yes/no choice to the user. The prompt must explain
-what Lianxh is, why installing the command helps (it enables help files and
-structured search directly from Stata), and where it installs (SSC writes into
-the local Stata ado directory). The table below maps agent platforms to their
-equivalent mechanisms:
+If Stata reports "command lianxh not found", stop before installing anything.
+Use the host agent's best available interactive confirmation mechanism to
+present a yes/no choice to the user. Prefer a structured approval or binary
+choice UI when available. If the host does not expose such a tool in the current
+mode, ask in ordinary chat and wait for an explicit user reply. Do not treat a
+general request to "test lianxh" as permission to install it.
+
+The prompt must explain what Lianxh is, why installing the command helps (it
+enables help files and structured search directly from Stata), and where it
+installs (SSC writes into the local Stata ado directory). The table below maps
+agent platforms to equivalent mechanisms:
 
 | Agent / Platform | Interactive prompt mechanism |
 |---|---|
 | **Claude Code** | `AskUserQuestion` tool — set `"header"` to `"Install lianxh?"`, provide two options: **安装 (Recommended)** and **跳过** |
-| **Codex (OpenAI)** | `ask_user` approval hook with `type: "approval"` |
-| **OpenCode** | Use CLI interactive input (`read` / prompt) |
+| **Codex (OpenAI)** | Use a structured approval/question tool if the current surface exposes one; otherwise ask in chat and wait |
+| **OpenCode** | Use CLI interactive input (`read` / prompt) or stop and ask in chat |
 | **Cline / Roo Code** | `ask_followup_question` tool with two options |
 | **Aider** | Architecture-level prompt via `/ask` or inline confirmation |
 | **GitHub Copilot Chat** | `followup` prompt with option array |
 | **Hermes** | Custom dialog tool — format as a structured binary choice |
 
-If the user agrees, run:
+Use this fallback wording when no structured prompt tool is available:
+
+```text
+检测到 lianxh 未安装。
+
+lianxh 是连享会提供的第三方 Stata 命令。安装后会写入本机 Stata ado 目录，
+用于通过 Stata 检索连享会文章、教程和资源列表。
+
+是否允许安装 lianxh？
+- 安装：运行 ssc install lianxh，然后继续测试/检索
+- 跳过：不修改 Stata ado 环境，并跳过 lianxh 检索
+```
+
+Only if the user explicitly agrees, run:
 
 ```stata
 ssc install lianxh
