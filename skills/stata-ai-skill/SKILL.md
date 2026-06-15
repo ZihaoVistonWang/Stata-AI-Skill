@@ -1,6 +1,6 @@
 ---
 name: stata-ai-skill
-description: Run Stata code and statistical analysis through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, or econometrics workflows. No VS Code, Node.js, or Python runtime is required on the user side.
+description: Run Stata code and statistical analysis through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, econometrics workflows, or search Stata articles and cookbook-style resources with lianxh. No VS Code, Node.js, or Python runtime is required on the user side.
 ---
 
 # Stata AI Skill
@@ -261,6 +261,69 @@ curl -s -X POST http://127.0.0.1:19522/execute \
   -H "Content-Type: application/json" \
   -d '{"cwd":"/Users/me/project","code":"use data/auto.dta, clear\nsummarize"}'
 ```
+
+## Lianxh Search
+
+Use the `lianxh` Stata command when the user needs Stata cookbook-style
+examples, command tutorials, or high-quality Stata articles that are not
+already available in local context.
+
+Limit each user task to at most three `lianxh <keywords>, md` search queries to
+avoid excessive output and token use. `help lianxh_cn`, `help lianxh`, and an
+explicitly approved `ssc install lianxh` do not count toward this three-query
+search limit.
+
+Before running `lianxh`, tell the user in their language that Lianxh
+(`https://www.lianxh.cn/`) is a third-party website that publishes Stata
+articles, tutorials, and resource lists, and ask whether they want you to query
+it through Stata. Do not run `lianxh` before the user agrees.
+
+After the user agrees:
+
+1. Inspect the installed command help first:
+
+```stata
+help lianxh_cn
+```
+
+If Chinese help is not suitable for the conversation, or if it is unavailable,
+use:
+
+```stata
+help lianxh
+```
+
+2. Prefer Chinese search keywords when they fit the user's topic. Request
+Markdown output so article titles and links are easy to inspect. Run no more
+than three search commands for the task:
+
+```stata
+lianxh 关键词1 关键词2 关键词3, md
+```
+
+Example:
+
+```stata
+lianxh 面板数据 DID, md
+```
+
+3. If Stata reports that `lianxh` is not installed or cannot be found, tell the
+user in their language that installing it from SSC will modify their local
+Stata ado environment. Ask for explicit permission before installing. Only
+after the user agrees, run:
+
+```stata
+ssc install lianxh
+```
+
+Then retry the help/search command.
+
+4. Treat the Markdown list returned by `lianxh ..., md` as candidate references.
+Use the article titles and `https://www.lianxh.cn/` links to decide which
+resources are relevant before summarizing or citing them.
+
+If installation or search fails because Stata cannot reach the network, report
+the network/package error to the user and continue with available local context.
 
 Response for a timed-out execution returns HTTP 408 with:
 

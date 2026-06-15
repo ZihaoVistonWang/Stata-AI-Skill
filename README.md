@@ -153,6 +153,34 @@ including `config.port`, `config.stataPath`, `config.configFile`,
 `config.logDir`, `config.tempDir`, `config.graphDir`, `capabilities.cwd`, and
 `capabilities.timeoutMaxSeconds`.
 
+## Lianxh Stata Resources
+
+Agents can use the community `lianxh` Stata command to search
+[Lianxh](https://www.lianxh.cn/) for Stata articles, tutorials, and
+cookbook-style examples when local knowledge is not enough.
+
+This is a third-party resource workflow, not a built-in database. Before using
+it, agents should explain in the user's language that Lianxh is an external
+Stata resource website and ask whether the user wants to query it through
+Stata. After the user agrees, agents should inspect `help lianxh` or
+`help lianxh_cn`, then prefer Markdown search output such as:
+
+```stata
+lianxh 面板数据 DID, md
+```
+
+To avoid excessive output and token use, agents should run at most three
+`lianxh <keywords>, md` search queries per user task. Help checks and an
+explicitly approved `ssc install lianxh` do not count toward this limit.
+
+If the command is not installed, agents should explain that installing it from
+SSC will modify the user's local Stata ado environment and ask for explicit
+permission before running:
+
+```stata
+ssc install lianxh
+```
+
 ## System Directories
 
 The service never creates `.stata-all-in-one/` in the repository or current
@@ -177,3 +205,9 @@ brew update
 brew install rust
 cargo run -p xtask -- dist
 ```
+
+## Acknowledgements
+
+Thanks to [Lianxh](https://www.lianxh.cn/) for publishing high-quality Stata
+articles, tutorials, and resource indexes that can complement agent-assisted
+Stata workflows.
