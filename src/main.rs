@@ -9,11 +9,14 @@ use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use serde_json::{json, Value};
+
 const SERVICE_NAME: &str = "stata-all-in-one-ai-skill";
 const SKILL_VERSION: &str = "202606130001";
 const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
+const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -484,6 +487,7 @@ fn example_paths() -> Vec<String> {
 }
 
 struct AppState {
+    config: AppConfig,
     paths: AppPaths,
     discovery: Discovery,
     session: Option<Arc<StataSession>>,
@@ -493,6 +497,7 @@ struct AppState {
 }
 
 fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
+    let port = config.port;
     let discovery = discover_stata(config.stata_path.as_deref());
     let (session, init_error) = if discovery.needs_license {
         let license_path = discovery
@@ -516,6 +521,7 @@ fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
     };
 
     let state = Arc::new(AppState {
+        config,
         paths,
         discovery,
         session,
@@ -523,7 +529,7 @@ fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
         busy: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
     });
-    let addr = format!("127.0.0.1:{}", config.port);
+    let addr = format!("127.0.0.1:{port}");
     let listener =
         TcpListener::bind(&addr).map_err(|err| format!("failed to bind {addr}: {err}"))?;
     listener
@@ -552,12 +558,11 @@ fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
 }
 
 fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> {
-    let mut buffer = vec![0_u8; 1024 * 1024];
-    let n = stream
-        .read(&mut buffer)
-        .map_err(|err| format!("failed to read request: {err}"))?;
-    let request = String::from_utf8_lossy(&buffer[..n]).to_string();
-    let (head, body) = request.split_once("\r\n\r\n").unwrap_or((&request, ""));
+    let request = match read_http_request(&mut stream) {
+        Ok(request) => request,
+        Err(err) => return write_response(&mut stream, 400, &json_error(&err)),
+    };
+    let (head, body) = split_http_request(&request).unwrap_or((&request, ""));
     let mut lines = head.lines();
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
@@ -578,6 +583,65 @@ fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> 
     write_response(&mut stream, status, &json)
 }
 
+fn read_http_request(stream: &mut TcpStream) -> Result<String> {
+    let mut buffer = vec![0_u8; 8192];
+    let mut request = Vec::new();
+    let mut header_end = None;
+
+    loop {
+        let n = stream
+            .read(&mut buffer)
+            .map_err(|err| format!("failed to read request: {err}"))?;
+        if n == 0 {
+            break;
+        }
+        request.extend_from_slice(&buffer[..n]);
+        if request.len() > MAX_REQUEST_BYTES {
+            return Err(format!("request exceeds {MAX_REQUEST_BYTES} bytes"));
+        }
+        if header_end.is_none() {
+            header_end = find_header_end(&request);
+        }
+        if let Some(end) = header_end {
+            let content_length = content_length_from_head(&request[..end])?;
+            let total = end + 4 + content_length;
+            if request.len() >= total {
+                request.truncate(total);
+                break;
+            }
+        }
+    }
+
+    String::from_utf8(request).map_err(|err| format!("request is not valid UTF-8: {err}"))
+}
+
+fn find_header_end(bytes: &[u8]) -> Option<usize> {
+    bytes.windows(4).position(|window| window == b"\r\n\r\n")
+}
+
+fn split_http_request(request: &str) -> Option<(&str, &str)> {
+    request.split_once("\r\n\r\n")
+}
+
+fn content_length_from_head(head: &[u8]) -> Result<usize> {
+    let head = String::from_utf8_lossy(head);
+    for line in head.lines().skip(1) {
+        if let Some((name, value)) = line.split_once(':') {
+            if name.trim().eq_ignore_ascii_case("content-length") {
+                let length = value
+                    .trim()
+                    .parse::<usize>()
+                    .map_err(|err| format!("invalid Content-Length: {err}"))?;
+                if length > MAX_REQUEST_BYTES {
+                    return Err(format!("request body exceeds {MAX_REQUEST_BYTES} bytes"));
+                }
+                return Ok(length);
+            }
+        }
+    }
+    Ok(0)
+}
+
 fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
     let reason = match status {
         200 => "OK",
@@ -590,7 +654,7 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()>
         _ => "OK",
     };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -619,40 +683,46 @@ fn status_json(state: &AppState) -> String {
     } else {
         state.discovery.message.clone()
     };
-    format!(
-        "{{\"service\":\"{}\",\"skillVersion\":\"{}\",\"status\":\"{}\",\"sessionActive\":{},\"busy\":{},\"needsConfiguration\":{},\"needsLicense\":{},\"licenseFound\":{},\"licensePath\":{},\"missing\":{},\"message\":\"{}\",\"examplePaths\":{},\"detectedCandidates\":{},\"initError\":{}}}",
-        SERVICE_NAME,
-        SKILL_VERSION,
-        if state.shutting_down.load(Ordering::SeqCst) { "shutting_down" } else { "running" },
-        session_active,
-        state.busy.load(Ordering::SeqCst),
-        needs_configuration,
-        needs_license,
-        state.discovery.license_found,
-        state
-            .discovery
-            .license_path
-            .as_ref()
-            .map(|p| format!("\"{}\"", json_escape(&p.to_string_lossy())))
-            .unwrap_or_else(|| "null".to_string()),
-        if needs_configuration {
-            "\"stata_library_path\""
+    json!({
+        "service": SERVICE_NAME,
+        "skillVersion": SKILL_VERSION,
+        "status": if state.shutting_down.load(Ordering::SeqCst) { "shutting_down" } else { "running" },
+        "sessionActive": session_active,
+        "busy": state.busy.load(Ordering::SeqCst),
+        "needsConfiguration": needs_configuration,
+        "needsLicense": needs_license,
+        "licenseFound": state.discovery.license_found,
+        "licensePath": state.discovery.license_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "missing": if needs_configuration {
+            Some("stata_library_path")
         } else if needs_license {
-            "\"stata_license\""
+            Some("stata_license")
         } else if state.init_error.is_some() {
-            "\"stata_initialization\""
+            Some("stata_initialization")
         } else {
-            "null"
+            None
         },
-        json_escape(&message),
-        json_string_array(&state.discovery.examples),
-        json_path_array(&state.discovery.candidates),
-        state
-            .init_error
-            .as_ref()
-            .map(|err| format!("\"{}\"", json_escape(err)))
-            .unwrap_or_else(|| "null".to_string())
-    )
+        "message": message,
+        "examplePaths": &state.discovery.examples,
+        "detectedCandidates": paths_to_strings(&state.discovery.candidates),
+        "initError": &state.init_error,
+        "config": {
+            "port": state.config.port,
+            "stataPath": state.config.stata_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "configFile": state.paths.config_file.to_string_lossy().to_string(),
+            "logDir": state.paths.log_dir.to_string_lossy().to_string(),
+            "tempDir": state.paths.temp_dir.to_string_lossy().to_string(),
+            "graphDir": state.paths.graph_dir.to_string_lossy().to_string()
+        },
+        "capabilities": {
+            "execute": true,
+            "file": true,
+            "cwd": true,
+            "timeoutMaxSeconds": MAX_TIMEOUT_SEC,
+            "graphs": "svg"
+        }
+    })
+    .to_string()
 }
 
 fn execute_json(state: &AppState, body: &str) -> (u16, String) {
@@ -678,7 +748,13 @@ fn execute_json(state: &AppState, body: &str) -> (u16, String) {
         return (409, json_error("Stata is busy executing another command"));
     }
 
-    let request = ExecuteRequest::parse(body);
+    let request = match ExecuteRequest::parse(body) {
+        Ok(request) => request,
+        Err(err) => {
+            state.busy.store(false, Ordering::SeqCst);
+            return (400, json_error(&err));
+        }
+    };
     let result = execute_inner(state, session, request);
     state.busy.store(false, Ordering::SeqCst);
     result
@@ -692,7 +768,8 @@ fn execute_inner(
     if request.code.trim().is_empty() && request.file.trim().is_empty() {
         return (400, json_error("Provide `code` or `file` in JSON body."));
     }
-    let prepared = match prepare_command(state, &request.code, &request.file) {
+    let prepared = match prepare_command_with_cwd(state, &request.code, &request.file, &request.cwd)
+    {
         Ok(prepared) => prepared,
         Err(err) => return (400, json_error(&err)),
     };
@@ -747,12 +824,14 @@ fn execute_inner(
     (
         status,
         format!(
-            "{{\"success\":{},\"returnCode\":{},\"output\":\"{}\",\"error\":\"{}\",\"graphs\":{}}}",
-            result.success,
-            result.return_code,
-            json_escape(&result.output),
-            json_escape(&result.error),
-            graphs_json(&graphs)
+            "{}",
+            json!({
+                "success": result.success,
+                "returnCode": result.return_code,
+                "output": result.output,
+                "error": result.error,
+                "graphs": graph_values(&graphs)
+            })
         ),
     )
 }
@@ -790,22 +869,26 @@ fn shutdown_json(state: &AppState) -> (u16, String) {
     )
 }
 
-#[derive(Default)]
+#[derive(Debug, Default)]
 struct ExecuteRequest {
     code: String,
     file: String,
     timeout: Option<u64>,
     echo: bool,
+    cwd: String,
 }
 
 impl ExecuteRequest {
-    fn parse(body: &str) -> Self {
-        Self {
-            code: json_string_field(body, "code").unwrap_or_default(),
-            file: json_string_field(body, "file").unwrap_or_default(),
-            timeout: json_number_field(body, "timeout"),
-            echo: json_bool_field(body, "echo").unwrap_or(false),
-        }
+    fn parse(body: &str) -> Result<Self> {
+        let value: Value =
+            serde_json::from_str(body).map_err(|err| format!("invalid JSON body: {err}"))?;
+        Ok(Self {
+            code: optional_string(&value, "code")?.unwrap_or_default(),
+            file: optional_string(&value, "file")?.unwrap_or_default(),
+            timeout: optional_u64(&value, "timeout")?,
+            echo: optional_bool(&value, "echo")?.unwrap_or(false),
+            cwd: optional_string(&value, "cwd")?.unwrap_or_default(),
+        })
     }
 }
 
@@ -814,21 +897,40 @@ struct PreparedCommand {
     temp_file: Option<PathBuf>,
 }
 
-fn prepare_command(state: &AppState, code: &str, file: &str) -> Result<PreparedCommand> {
+fn prepare_command_with_cwd(
+    state: &AppState,
+    code: &str,
+    file: &str,
+    cwd: &str,
+) -> Result<PreparedCommand> {
+    let mut prefix = Vec::new();
+    if !cwd.trim().is_empty() {
+        prefix.push(format!("cd \"{}\"", escape_stata_path(cwd.trim())));
+    }
     if !file.trim().is_empty() {
+        prefix.push(format!("do \"{}\"", escape_stata_path(file.trim())));
         return Ok(PreparedCommand {
-            command: format!("do \"{}\"", escape_stata_path(file.trim())),
+            command: prefix.join("\n"),
             temp_file: None,
         });
     }
     let normalized = normalize_code(&strip_graph_export(code));
     if normalized.is_empty() {
-        return Ok(PreparedCommand {
-            command: "display \"graph export command ignored; graphs are exported automatically\""
+        prefix.push(
+            "display \"graph export command ignored; graphs are exported automatically\""
                 .to_string(),
+        );
+        return Ok(PreparedCommand {
+            command: prefix.join("\n"),
             temp_file: None,
         });
     }
+    let normalized = if prefix.is_empty() {
+        normalized
+    } else {
+        prefix.push(normalized);
+        prefix.join("\n")
+    };
     if normalized
         .lines()
         .filter(|line| !line.trim().is_empty())
@@ -1087,10 +1189,6 @@ impl NativeApi {
         }
     }
 
-    fn set_break(&self) {
-        unsafe { (self.set_break)() }
-    }
-
     fn shutdown(&self) {
         unsafe { (self.shutdown)() }
     }
@@ -1105,6 +1203,7 @@ impl Drop for NativeApi {
 #[cfg(not(target_os = "windows"))]
 struct PlatformSession {
     api: Mutex<NativeApi>,
+    break_fn: StataSetBreak,
 }
 
 #[cfg(not(target_os = "windows"))]
@@ -1112,8 +1211,10 @@ impl PlatformSession {
     fn new(library_path: &Path) -> Result<Self> {
         let api = unsafe { NativeApi::load(library_path)? };
         api.init(library_path)?;
+        let break_fn = api.set_break;
         Ok(Self {
             api: Mutex::new(api),
+            break_fn,
         })
     }
 
@@ -1130,13 +1231,8 @@ impl PlatformSession {
     }
 
     fn set_break(&self) -> bool {
-        self.api
-            .lock()
-            .map(|api| {
-                api.set_break();
-                true
-            })
-            .unwrap_or(false)
+        unsafe { (self.break_fn)() };
+        true
     }
 
     fn shutdown(&self) {
@@ -1426,125 +1522,13 @@ extern "system" {
     fn FreeLibrary(handle: *mut c_void) -> c_int;
 }
 
-fn json_string_field(body: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{key}\"");
-    let start = body.find(&pattern)?;
-    let after_key = &body[start + pattern.len()..];
-    let colon = after_key.find(':')?;
-    let after_colon = after_key[colon + 1..].trim_start();
-    if !after_colon.starts_with('"') {
-        return None;
-    }
-    parse_json_string(after_colon)
-}
-
-fn parse_json_string(text: &str) -> Option<String> {
-    let mut out = String::new();
-    let mut chars = text[1..].chars();
-    while let Some(ch) = chars.next() {
-        match ch {
-            '"' => return Some(out),
-            '\\' => {
-                let escaped = chars.next()?;
-                out.push(match escaped {
-                    'n' => '\n',
-                    'r' => '\r',
-                    't' => '\t',
-                    '"' => '"',
-                    '\\' => '\\',
-                    other => other,
-                });
-            }
-            other => out.push(other),
-        }
-    }
-    None
-}
-
-fn json_number_field(body: &str, key: &str) -> Option<u64> {
-    let pattern = format!("\"{key}\"");
-    let start = body.find(&pattern)?;
-    let after_key = &body[start + pattern.len()..];
-    let colon = after_key.find(':')?;
-    let digits: String = after_key[colon + 1..]
-        .trim_start()
-        .chars()
-        .take_while(|ch| ch.is_ascii_digit())
-        .collect();
-    digits.parse().ok()
-}
-
-fn json_bool_field(body: &str, key: &str) -> Option<bool> {
-    let pattern = format!("\"{key}\"");
-    let start = body.find(&pattern)?;
-    let after_key = &body[start + pattern.len()..];
-    let colon = after_key.find(':')?;
-    let value = after_key[colon + 1..].trim_start();
-    if value.starts_with("true") {
-        Some(true)
-    } else if value.starts_with("false") {
-        Some(false)
-    } else {
-        None
-    }
-}
-
-fn json_escape(value: &str) -> String {
-    value
-        .chars()
-        .flat_map(|ch| match ch {
-            '"' => "\\\"".chars().collect::<Vec<_>>(),
-            '\\' => "\\\\".chars().collect(),
-            '\n' => "\\n".chars().collect(),
-            '\r' => "\\r".chars().collect(),
-            '\t' => "\\t".chars().collect(),
-            other => vec![other],
-        })
-        .collect()
-}
-
 fn json_error(message: &str) -> String {
-    format!(
-        "{{\"success\":false,\"output\":\"\",\"error\":\"{}\"}}",
-        json_escape(message)
-    )
-}
-
-fn json_string_array(values: &[String]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|v| format!("\"{}\"", json_escape(v)))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn json_path_array(values: &[PathBuf]) -> String {
-    format!(
-        "[{}]",
-        values
-            .iter()
-            .map(|v| format!("\"{}\"", json_escape(&v.to_string_lossy())))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
-}
-
-fn graphs_json(graphs: &[GraphExport]) -> String {
-    format!(
-        "[{}]",
-        graphs
-            .iter()
-            .map(|g| format!(
-                "{{\"name\":\"{}\",\"svg\":\"{}\",\"png\":null}}",
-                json_escape(&g.name),
-                json_escape(&g.svg.to_string_lossy())
-            ))
-            .collect::<Vec<_>>()
-            .join(",")
-    )
+    json!({
+        "success": false,
+        "output": "",
+        "error": message
+    })
+    .to_string()
 }
 
 fn escape_stata_path(path: &str) -> String {
@@ -1557,4 +1541,146 @@ fn unique_id() -> String {
         .map(|d| d.as_millis())
         .unwrap_or(0);
     format!("{}_{}", millis, std::process::id())
+}
+
+fn paths_to_strings(paths: &[PathBuf]) -> Vec<String> {
+    paths
+        .iter()
+        .map(|path| path.to_string_lossy().to_string())
+        .collect()
+}
+
+fn graph_values(graphs: &[GraphExport]) -> Vec<Value> {
+    graphs
+        .iter()
+        .map(|graph| {
+            json!({
+                "name": graph.name,
+                "svg": graph.svg.to_string_lossy().to_string(),
+                "png": Value::Null
+            })
+        })
+        .collect()
+}
+
+fn optional_string(value: &Value, key: &str) -> Result<Option<String>> {
+    match value.get(key) {
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("`{key}` must be a string")),
+    }
+}
+
+fn optional_u64(value: &Value, key: &str) -> Result<Option<u64>> {
+    match value.get(key) {
+        Some(Value::Number(value)) => value
+            .as_u64()
+            .map(Some)
+            .ok_or_else(|| format!("`{key}` must be a non-negative integer")),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("`{key}` must be a non-negative integer")),
+    }
+}
+
+fn optional_bool(value: &Value, key: &str) -> Result<Option<bool>> {
+    match value.get(key) {
+        Some(Value::Bool(value)) => Ok(Some(*value)),
+        Some(Value::Null) | None => Ok(None),
+        Some(_) => Err(format!("`{key}` must be a boolean")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn test_state() -> AppState {
+        let root = env::temp_dir().join(format!("stata-ai-skill-test-{}", unique_id()));
+        AppState {
+            config: AppConfig {
+                port: 19522,
+                stata_path: None,
+            },
+            paths: AppPaths {
+                config_file: root.join("config.toml"),
+                log_dir: root.join("logs"),
+                temp_dir: root.join("tmp"),
+                graph_dir: root.join("graphs"),
+                config_dir: root,
+            },
+            discovery: Discovery {
+                library_path: None,
+                license_path: None,
+                license_found: false,
+                needs_configuration: true,
+                needs_license: false,
+                message: "test".to_string(),
+                examples: Vec::new(),
+                candidates: Vec::new(),
+            },
+            session: None,
+            init_error: None,
+            busy: AtomicBool::new(false),
+            shutting_down: AtomicBool::new(false),
+        }
+    }
+
+    #[test]
+    fn parses_execute_request_with_unicode_escapes() {
+        let request = ExecuteRequest::parse(
+            r#"{"code":"display \"\u4ef7\u683c\"","timeout":45,"echo":true,"cwd":"/tmp/stata"}"#,
+        )
+        .unwrap();
+
+        assert_eq!(request.code, "display \"价格\"");
+        assert_eq!(request.timeout, Some(45));
+        assert!(request.echo);
+        assert_eq!(request.cwd, "/tmp/stata");
+    }
+
+    #[test]
+    fn rejects_invalid_execute_field_types() {
+        let err = ExecuteRequest::parse(r#"{"code":123}"#).unwrap_err();
+        assert_eq!(err, "`code` must be a string");
+    }
+
+    #[test]
+    fn extracts_content_length_case_insensitively() {
+        let length =
+            content_length_from_head(b"POST /execute HTTP/1.1\r\nhost: x\r\ncontent-length: 17")
+                .unwrap();
+
+        assert_eq!(length, 17);
+    }
+
+    #[test]
+    fn prepares_cwd_before_inline_code() {
+        let state = test_state();
+        let command =
+            prepare_command_with_cwd(&state, "display 2+2", "", "/Users/example project").unwrap();
+        let temp_file = command.temp_file.as_ref().unwrap();
+        let temp_code = fs::read_to_string(temp_file).unwrap();
+
+        assert_eq!(temp_code, "cd \"/Users/example project\"\ndisplay 2+2");
+        assert_eq!(
+            command.command,
+            format!("do \"{}\"", escape_stata_path(&temp_file.to_string_lossy()))
+        );
+        fs::remove_file(temp_file).unwrap();
+    }
+
+    #[test]
+    fn prepares_cwd_before_do_file() {
+        let state = test_state();
+        let command = prepare_command_with_cwd(&state, "", "analysis.do", "/tmp/work").unwrap();
+
+        assert_eq!(command.command, "cd \"/tmp/work\"\ndo \"analysis.do\"");
+    }
+
+    #[test]
+    fn parses_unique_graph_names() {
+        let names = parse_graph_names("Graph g1 g1 _tmp invalid-name 2bad");
+
+        assert_eq!(names, vec!["Graph", "g1", "_tmp"]);
+    }
 }

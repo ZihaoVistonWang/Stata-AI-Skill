@@ -106,7 +106,22 @@ stata-ai-skill serve
 ```
 
 Use the resolved executable path from "Locate The Executable"; the bare command
-above is only shorthand.
+above is only shorthand. Run the service as a long-lived background process so
+the agent can continue issuing HTTP requests. On macOS/zsh:
+
+```bash
+nohup ./bin/macos-arm64/stata-ai-skill serve > /tmp/stata-ai-skill.log 2>&1 &
+```
+
+If startup fails because the port is already in use, first recheck `/status`.
+If another Stata AI Skill service is already responding, reuse it. Otherwise
+choose another port and persist it:
+
+```bash
+./bin/macos-arm64/stata-ai-skill config set --port 19523
+nohup ./bin/macos-arm64/stata-ai-skill serve > /tmp/stata-ai-skill.log 2>&1 &
+curl -s http://127.0.0.1:19523/status
+```
 
 3. If `/status` returns `needsConfiguration: true`, ask the user where the Stata
 app/program is installed. Avoid saying only "Stata path" because some users do
@@ -153,6 +168,17 @@ Accepted paths include the Stata app/exe, install directory, or shared library:
 - Windows: `C:\Program Files\Stata18\mp-64.dll`
 
 4. Recheck `/status`. If `sessionActive: true`, call `/execute`.
+
+`/status` includes diagnostic fields agents should use for troubleshooting:
+
+- `config.port`
+- `config.stataPath`
+- `config.configFile`
+- `config.logDir`
+- `config.tempDir`
+- `config.graphDir`
+- `capabilities.cwd`
+- `capabilities.timeoutMaxSeconds`
 
 If `/status` returns `needsLicense: true` or `missing: "stata_license"`, Stata
 was found but the license file was not found. Tell the user:
@@ -225,6 +251,15 @@ For long commands, set `timeout` in seconds:
 curl -s -X POST http://127.0.0.1:19522/execute \
   -H "Content-Type: application/json" \
   -d '{"code":"bootstrap r(mean), reps(1000): summarize price", "timeout": 300}'
+```
+
+For workflows that use relative paths, set `cwd`. The service prepends a Stata
+`cd` command before running inline code or a do-file:
+
+```bash
+curl -s -X POST http://127.0.0.1:19522/execute \
+  -H "Content-Type: application/json" \
+  -d '{"cwd":"/Users/me/project","code":"use data/auto.dta, clear\nsummarize"}'
 ```
 
 Response for a timed-out execution returns HTTP 408 with:

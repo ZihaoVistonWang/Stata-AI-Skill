@@ -67,6 +67,23 @@ needed, write config via CLI, and call the HTTP API.
 curl http://127.0.0.1:19522/status
 ```
 
+For agent workflows, run the service as a long-lived background process and
+reuse an existing service when `/status` already responds:
+
+```bash
+nohup ./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill serve > /tmp/stata-ai-skill.log 2>&1 &
+curl -s http://127.0.0.1:19522/status
+```
+
+If port `19522` is occupied by another process, either reuse the responding
+Stata AI Skill service or configure a different port:
+
+```bash
+./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill config set --port 19523
+nohup ./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill serve > /tmp/stata-ai-skill.log 2>&1 &
+curl -s http://127.0.0.1:19523/status
+```
+
 If Stata cannot be found, `/status` returns `needsConfiguration: true`. The
 agent should ask the user where the Stata app/program is installed and run:
 
@@ -111,7 +128,7 @@ Accepted examples:
 ## HTTP API
 
 - `GET /status`
-- `POST /execute` with `{ "code": "...", "file": "...", "timeout": 30, "echo": false }`
+- `POST /execute` with `{ "code": "...", "file": "...", "timeout": 30, "echo": false, "cwd": "..." }`
 - `POST /break`
 - `POST /shutdown`
 
@@ -122,6 +139,19 @@ curl -s -X POST http://127.0.0.1:19522/execute \
   -H "Content-Type: application/json" \
   -d '{"code":"display 2+2"}'
 ```
+
+Use `cwd` when Stata code or do-files rely on relative paths:
+
+```bash
+curl -s -X POST http://127.0.0.1:19522/execute \
+  -H "Content-Type: application/json" \
+  -d '{"cwd":"/Users/me/project","code":"use data/auto.dta, clear\nsummarize"}'
+```
+
+`/status` includes operational diagnostics under `config` and `capabilities`,
+including `config.port`, `config.stataPath`, `config.configFile`,
+`config.logDir`, `config.tempDir`, `config.graphDir`, `capabilities.cwd`, and
+`capabilities.timeoutMaxSeconds`.
 
 ## System Directories
 
