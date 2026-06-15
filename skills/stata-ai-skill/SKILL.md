@@ -264,23 +264,57 @@ curl -s -X POST http://127.0.0.1:19522/execute \
 
 ## Lianxh Search
 
-Use the `lianxh` Stata command when the user needs Stata cookbook-style
-examples, command tutorials, or high-quality Stata articles that are not
-already available in local context.
+When the user needs Stata cookbook-style examples, command tutorials, or
+high-quality Stata articles, use the `lianxh` Stata command to search
+**Lianxh** (连享会, https://www.lianxh.cn/), a third-party website that
+publishes Stata tutorials, econometrics articles, and resource lists.
+
+### Limits
 
 Limit each user task to at most three `lianxh <keywords>, md` search queries to
 avoid excessive output and token use. `help lianxh_cn`, `help lianxh`, and an
 explicitly approved `ssc install lianxh` do not count toward this three-query
 search limit.
 
-Before running `lianxh`, tell the user in their language that Lianxh
-(`https://www.lianxh.cn/`) is a third-party website that publishes Stata
-articles, tutorials, and resource lists, and ask whether they want you to query
-it through Stata. Do not run `lianxh` before the user agrees.
+### Installation
 
-After the user agrees:
+Before the first `lianxh` search in a conversation, check whether the command
+is installed:
 
-1. Inspect the installed command help first:
+```stata
+which lianxh
+```
+
+If Stata reports "command lianxh not found", use the host agent's interactive
+prompt mechanism to present a yes/no choice to the user. The prompt must explain
+what Lianxh is, why installing the command helps (it enables help files and
+structured search directly from Stata), and where it installs (SSC writes into
+the local Stata ado directory). The table below maps agent platforms to their
+equivalent mechanisms:
+
+| Agent / Platform | Interactive prompt mechanism |
+|---|---|
+| **Claude Code** | `AskUserQuestion` tool — set `"header"` to `"Install lianxh?"`, provide two options: **安装 (Recommended)** and **跳过** |
+| **Codex (OpenAI)** | `ask_user` approval hook with `type: "approval"` |
+| **OpenCode** | Use CLI interactive input (`read` / prompt) |
+| **Cline / Roo Code** | `ask_followup_question` tool with two options |
+| **Aider** | Architecture-level prompt via `/ask` or inline confirmation |
+| **GitHub Copilot Chat** | `followup` prompt with option array |
+| **Hermes** | Custom dialog tool — format as a structured binary choice |
+
+If the user agrees, run:
+
+```stata
+ssc install lianxh
+```
+
+Then proceed with the help and search steps below. If the user declines, skip
+`lianxh`-based search and continue with available local context.
+
+### Help
+
+After confirming `lianxh` is installed, inspect the help file to confirm
+command syntax and available filters:
 
 ```stata
 help lianxh_cn
@@ -293,39 +327,27 @@ use:
 help lianxh
 ```
 
-2. Prefer Chinese search keywords when they fit the user's topic. Request
-Markdown output so article titles and links are easy to inspect. Run no more
-than three search commands for the task:
+### Search
+
+Use the `lianxh` command with Markdown output so article titles and links are
+easy to inspect:
 
 ```stata
 lianxh 关键词1 关键词2 关键词3, md
 ```
 
-Example:
-
-```stata
-lianxh 面板数据 DID, md
-```
-
-3. If Stata reports that `lianxh` is not installed or cannot be found, tell the
-user in their language that installing it from SSC will modify their local
-Stata ado environment. Ask for explicit permission before installing. Only
-after the user agrees, run:
-
-```stata
-ssc install lianxh
-```
-
-Then retry the help/search command.
-
-4. Treat the Markdown list returned by `lianxh ..., md` as candidate references.
-Use the article titles and `https://www.lianxh.cn/` links to decide which
-resources are relevant before summarizing or citing them.
+- Prefer Chinese search keywords when they fit the user's topic.
+- Run no more than three search commands for the task.
+- Treat the Markdown list returned by `lianxh ..., md` as candidate references.
+- Use the article titles and `https://www.lianxh.cn/` links to decide which
+  resources are relevant before summarizing or citing them.
 
 If installation or search fails because Stata cannot reach the network, report
-the network/package error to the user and continue with available local context.
+the error to the user and continue with available local context.
 
-Response for a timed-out execution returns HTTP 408 with:
+### Timeout
+
+A timed-out `lianxh` execution returns HTTP 408 with:
 
 ```json
 {"success":false,"returnCode":-1,"output":"Execution timed out after 3s","error":"Execution timed out after 3s","graphs":[]}
