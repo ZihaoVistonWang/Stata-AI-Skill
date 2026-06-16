@@ -201,25 +201,31 @@ often mangled because PowerShell intercepts the quotes before they reach curl.
 The double quotes inside `-d '{"code":"..."}'` get stripped or misinterpreted.
 
 **Do NOT use inline JSON with curl.exe in PowerShell.** Instead, always write
-the JSON body to a temporary file and use `--data-binary @file`:
+the JSON body to a temporary file and use `--data-binary @file`.
+
+**Critical:** PowerShell 5.1's `Out-File -Encoding utf8` writes a UTF-8 BOM
+(byte-order mark) that breaks JSON parsers (serde_json returns "expected value
+at line 1 column 1"). Use `[System.IO.File]::WriteAllText` with
+`[System.Text.UTF8Encoding]::new($false)` to write clean UTF-8 without BOM:
 
 ```powershell
-# Correct approach — write JSON to a temp file first
+# Correct — UTF-8 without BOM
 $body = '{"code":"display 2+2"}'
-$body | Out-File -FilePath "$env:TEMP\stata_body.json" -Encoding utf8 -NoNewline
+[System.IO.File]::WriteAllText("$env:TEMP\stata_body.json", $body, [System.Text.UTF8Encoding]::new($false))
 curl.exe -s -X POST http://127.0.0.1:19522/execute `
   -H "Content-Type: application/json" `
   --data-binary "@$env:TEMP\stata_body.json"
 ```
 
-This also avoids encoding issues with `Invoke-RestMethod` in PowerShell 5.1.
+`Invoke-RestMethod` in PowerShell 5.1 has similar encoding issues; prefer the
+file approach above.
 
 For multi-line Stata code, use a literal `\n` (backslash + n) inside the JSON
 string — the JSON parser will convert it to an actual newline:
 
 ```powershell
 $body = '{"code":"sysuse auto, clear\nsummarize price mpg"}'
-$body | Out-File -FilePath "$env:TEMP\stata_body.json" -Encoding utf8 -NoNewline
+[System.IO.File]::WriteAllText("$env:TEMP\stata_body.json", $body, [System.Text.UTF8Encoding]::new($false))
 curl.exe -s -X POST http://127.0.0.1:19522/execute `
   -H "Content-Type: application/json" `
   --data-binary "@$env:TEMP\stata_body.json"
