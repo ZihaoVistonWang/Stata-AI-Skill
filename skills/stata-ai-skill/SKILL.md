@@ -194,6 +194,56 @@ Common license locations:
 
 ## Execute
 
+### Run Existing Do-Files Directly
+
+When the user provides an existing `.do` file, pass its path in the `file`
+field. Prefer this over copying the file, reading it with Python or shell
+commands, or sending its contents through `code`.
+
+- Use `file` for an existing `.do` file and `code` for inline Stata commands.
+- Use an absolute `file` path whenever possible. Paths containing spaces are
+  supported; JSON-encode the path normally and do not copy it to `/tmp`.
+- Set `cwd` to the do-file's project directory when it uses relative paths for
+  datasets, included do-files, logs, or generated output.
+- The file must be accessible to the local Stata AI Skill service process.
+- Do not send both `file` and `code`; if both are present, `file` takes
+  precedence.
+
+#### macOS And Linux
+
+Use `curl` from bash or zsh:
+
+```bash
+curl -s -X POST http://127.0.0.1:19522/execute \
+  -H "Content-Type: application/json" \
+  -d '{"file":"/Users/me/project/analysis.do","cwd":"/Users/me/project","timeout":120}'
+```
+
+#### Windows Command Prompt
+
+Windows supports both Command Prompt (`cmd.exe`) and PowerShell; PowerShell is
+not required. From Command Prompt, escape the JSON double quotes:
+
+```cmd
+curl.exe -s -X POST http://127.0.0.1:19522/execute -H "Content-Type: application/json" -d "{\"file\":\"C:\\Users\\me\\project\\analysis.do\",\"cwd\":\"C:\\Users\\me\\project\",\"timeout\":120}"
+```
+
+#### Windows PowerShell
+
+Write the request JSON, not the do-file, to a temporary UTF-8 file without a
+BOM, then send it with `curl.exe`:
+
+```powershell
+$body = '{"file":"C:\\Users\\me\\project\\analysis.do","cwd":"C:\\Users\\me\\project","timeout":120}'
+[System.IO.File]::WriteAllText("$env:TEMP\stata_body.json", $body, [System.Text.UTF8Encoding]::new($false))
+curl.exe -s -X POST http://127.0.0.1:19522/execute `
+  -H "Content-Type: application/json" `
+  --data-binary "@$env:TEMP\stata_body.json"
+```
+
+In all three cases, the service executes the do-file directly and applies `cwd`
+before the `do` command.
+
 ### PowerShell Curl Notes
 
 In PowerShell, `curl.exe -d` with a JSON body containing double quotes is
