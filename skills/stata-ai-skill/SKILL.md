@@ -194,6 +194,17 @@ Common license locations:
 
 ## Execute
 
+### Read Command Help First
+
+Before using a specific Stata command, first run `help <command>` through
+`/execute` and read its documentation. Confirm the command syntax, options, and
+version-specific behavior before composing the final analysis command. For
+example, run `help regress` before using `regress`.
+
+If Stata reports that the help file or command is unavailable, do not guess its
+syntax. Report the missing command and request approval before installing any
+community-contributed package.
+
 ### Run Existing Do-Files Directly
 
 When the user provides an existing `.do` file, pass its path in the `file`
