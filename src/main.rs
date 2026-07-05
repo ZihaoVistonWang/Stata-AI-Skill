@@ -12,7 +12,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use serde_json::{json, Value};
 
 const SERVICE_NAME: &str = "stata-ai-skill";
-const SKILL_VERSION: &str = "202606130001";
+const SKILL_VERSION: &str = "202607060001";
 const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
