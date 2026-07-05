@@ -329,6 +329,32 @@ curl -s -X POST http://127.0.0.1:19522/execute \
   -d '{"cwd":"/Users/me/project","code":"use data/auto.dta, clear\nsummarize"}'
 ```
 
+### Graph Export
+
+The standalone service enables Stata graph capture with `quietly _gr_list on`
+after session initialization. If user code contains `graph export`,
+`. graph export`, or `quietly graph export`, the service parses the requested
+path and common options such as `replace` and `name(...)`.
+
+Explicit SVG exports are executed safely and returned in the response
+`graphs` array:
+
+```json
+[{ "name": "Graph", "svg": "/absolute/path/to/foo.svg", "png": null }]
+```
+
+PNG/JPG/JPEG exports are supported without asking Stata to write those formats
+directly. The standalone service exports SVG first, converts it with bundled
+Rust libraries, keeps the SVG path, and writes the requested bitmap path. For
+PNG requests, the `png` field contains the generated PNG path. For JPG/JPEG
+requests, `png` remains `null` and the graph object includes `file` and
+`format` fields for the generated bitmap. Other unsafe bitmap formats such as
+TIF and TIFF are still rewritten to SVG and reported in `output`.
+
+If user code does not contain an explicit `graph export`, successful executions
+keep the automatic `_gr_list` SVG export behavior and return generated SVG
+paths under `graphs`.
+
 ## Lianxh Search
 
 When the user needs Stata cookbook-style examples, command tutorials, or
@@ -473,5 +499,6 @@ curl -s -X POST http://127.0.0.1:19522/shutdown
 
 The service uses system directories only. It does not create `.stata-all-in-one/`
 in the current repository or working directory. Temporary `.do` files are unique
-and deleted after execution. Graphs are exported as SVG to the service graph
-directory and returned as absolute paths in `graphs`.
+and deleted after execution. Graphs are first exported as SVG and returned as
+absolute paths in `graphs`; explicit PNG/JPG/JPEG requests are converted from
+that SVG without requiring a system image converter.

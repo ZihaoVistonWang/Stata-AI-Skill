@@ -148,6 +148,24 @@ curl -s -X POST http://127.0.0.1:19522/execute \
   -d '{"cwd":"/Users/me/project","code":"use data/auto.dta, clear\nsummarize"}'
 ```
 
+Graph export support:
+
+- The service enables Stata graph capture with `quietly _gr_list on` after
+  session initialization.
+- If user code contains `graph export`, `. graph export`, or
+  `quietly graph export`, the service parses the requested path and common
+  options such as `replace` and `name(...)`.
+- Explicit SVG exports are executed safely and returned in `graphs`, for
+  example `[{ "name": "Graph", "svg": "/path/to/foo.svg", "png": null }]`.
+- PNG/JPG/JPEG exports are not sent directly to Stata because they can hang in
+  headless sessions. The service exports SVG first, converts it with bundled
+  Rust libraries, keeps the SVG, and writes the requested bitmap path.
+- Other unsafe bitmap formats such as TIF and TIFF are still rewritten to SVG
+  and noted in `output`.
+- If no explicit `graph export` command is present, successful executions keep
+  the existing automatic `_gr_list` SVG export behavior into
+  `config.graphDir`.
+
 `/status` includes operational diagnostics under `config` and `capabilities`,
 including `config.port`, `config.stataPath`, `config.configFile`,
 `config.logDir`, `config.tempDir`, `config.graphDir`, `capabilities.cwd`, and
@@ -194,6 +212,16 @@ working directory.
 - Windows logs: `%LOCALAPPDATA%\StataAISkill\Logs\`
 - Windows graphs: `%LOCALAPPDATA%\StataAISkill\Graphs\`
 - Windows temp: `%TEMP%\StataAISkill\`
+
+`graphs` uses a stable compatibility shape:
+
+```json
+[{ "name": "Graph", "svg": "/absolute/path/to/graph.svg", "png": null }]
+```
+
+For explicit PNG exports, `png` is the generated PNG path. For explicit JPG or
+JPEG exports, the object also includes `file` and `format` fields, while `png`
+remains `null`.
 
 ## Development
 

@@ -4,7 +4,7 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -17,6 +17,7 @@ const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type Result<T> = std::result::Result<T, String>;
 
@@ -513,7 +514,10 @@ fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
         )
     } else if let Some(lib) = &discovery.library_path {
         match StataSession::new(lib) {
-            Ok(session) => (Some(Arc::new(session)), None),
+            Ok(session) => {
+                let _ = session.execute("quietly _gr_list on", false);
+                (Some(Arc::new(session)), None)
+            }
             Err(err) => (None, Some(err)),
         }
     } else {
@@ -719,7 +723,7 @@ fn status_json(state: &AppState) -> String {
             "file": true,
             "cwd": true,
             "timeoutMaxSeconds": MAX_TIMEOUT_SEC,
-            "graphs": "svg"
+            "graphs": "svg,png,jpg"
         }
     })
     .to_string()
@@ -806,11 +810,23 @@ fn execute_inner(
     if let Some(path) = prepared.temp_file {
         let _ = fs::remove_file(path);
     }
-    let graphs = if result.success {
-        export_graphs(state, &session)
+    let (graphs, graph_notes) = if result.success {
+        if prepared.graph_exports.is_empty() {
+            (export_graphs(state, &session), Vec::new())
+        } else {
+            export_requested_graphs(state, &session, &prepared.graph_exports)
+        }
     } else {
-        Vec::new()
+        (Vec::new(), Vec::new())
     };
+    if result.success && !graph_notes.is_empty() {
+        if !result.output.is_empty() {
+            result.output.push_str("\n\n");
+        }
+        result
+            .output
+            .push_str(&format!("[Stata AI Skill] {}", graph_notes.join(" ")));
+    }
     let status = if result.success {
         200
     } else if result.error.contains("timed out") {
@@ -895,6 +911,49 @@ impl ExecuteRequest {
 struct PreparedCommand {
     command: String,
     temp_file: Option<PathBuf>,
+    graph_exports: Vec<GraphExportRequest>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct GraphExportRequest {
+    original_line: String,
+    target: PathBuf,
+    bitmap_path: Option<PathBuf>,
+    bitmap_format: Option<BitmapFormat>,
+    name: Option<String>,
+    replace: bool,
+    requested_format: String,
+    rewritten_to_svg: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BitmapFormat {
+    Png,
+    Jpg,
+}
+
+impl BitmapFormat {
+    fn from_graph_format(format: &str) -> Option<Self> {
+        match format.to_ascii_lowercase().as_str() {
+            "png" => Some(Self::Png),
+            "jpg" | "jpeg" => Some(Self::Jpg),
+            _ => None,
+        }
+    }
+
+    fn extension(self) -> &'static str {
+        match self {
+            Self::Png => "png",
+            Self::Jpg => "jpg",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Png => "PNG",
+            Self::Jpg => "JPG",
+        }
+    }
 }
 
 fn prepare_command_with_cwd(
@@ -909,20 +968,30 @@ fn prepare_command_with_cwd(
     }
     if !file.trim().is_empty() {
         prefix.push(format!("do \"{}\"", escape_stata_path(file.trim())));
+        if prefix.len() > 1 {
+            let path = write_temp_do_file(state, &prefix.join("\n"))?;
+            return Ok(PreparedCommand {
+                command: format!("do \"{}\"", escape_stata_path(&path.to_string_lossy())),
+                temp_file: Some(path),
+                graph_exports: Vec::new(),
+            });
+        }
         return Ok(PreparedCommand {
             command: prefix.join("\n"),
             temp_file: None,
+            graph_exports: Vec::new(),
         });
     }
-    let normalized = normalize_code(&strip_graph_export(code));
+    let extracted = extract_graph_exports(code, cwd)?;
+    let normalized = normalize_code(&extracted.code);
     if normalized.is_empty() {
-        prefix.push(
-            "display \"graph export command ignored; graphs are exported automatically\""
-                .to_string(),
-        );
+        if prefix.is_empty() {
+            prefix.push("display \"\"".to_string());
+        }
         return Ok(PreparedCommand {
             command: prefix.join("\n"),
             temp_file: None,
+            graph_exports: extracted.exports,
         });
     }
     let normalized = if prefix.is_empty() {
@@ -937,24 +1006,30 @@ fn prepare_command_with_cwd(
         .count()
         > 1
     {
-        fs::create_dir_all(&state.paths.temp_dir)
-            .map_err(|err| format!("failed to create temp dir: {err}"))?;
-        let path = state
-            .paths
-            .temp_dir
-            .join(format!("stata_ai_skill_{}.do", unique_id()));
-        fs::write(&path, normalized)
-            .map_err(|err| format!("failed to write temp do file: {err}"))?;
+        let path = write_temp_do_file(state, &normalized)?;
         Ok(PreparedCommand {
             command: format!("do \"{}\"", escape_stata_path(&path.to_string_lossy())),
             temp_file: Some(path),
+            graph_exports: extracted.exports,
         })
     } else {
         Ok(PreparedCommand {
             command: normalized,
             temp_file: None,
+            graph_exports: extracted.exports,
         })
     }
+}
+
+fn write_temp_do_file(state: &AppState, code: &str) -> Result<PathBuf> {
+    fs::create_dir_all(&state.paths.temp_dir)
+        .map_err(|err| format!("failed to create temp dir: {err}"))?;
+    let path = state
+        .paths
+        .temp_dir
+        .join(format!("stata_ai_skill_{}.do", unique_id()));
+    fs::write(&path, code).map_err(|err| format!("failed to write temp do file: {err}"))?;
+    Ok(path)
 }
 
 fn normalize_code(code: &str) -> String {
@@ -975,24 +1050,241 @@ fn normalize_code(code: &str) -> String {
         .to_string()
 }
 
-fn strip_graph_export(code: &str) -> String {
-    code.lines()
-        .filter(|line| {
-            let lower = line
-                .trim_start()
-                .trim_start_matches('.')
-                .trim_start()
-                .to_ascii_lowercase();
-            !(lower.starts_with("graph export") || lower.starts_with("quietly graph export"))
+struct ExtractedGraphExports {
+    code: String,
+    exports: Vec<GraphExportRequest>,
+}
+
+fn extract_graph_exports(code: &str, cwd: &str) -> Result<ExtractedGraphExports> {
+    let mut kept = Vec::new();
+    let mut exports = Vec::new();
+    for line in code.replace("\r\n", "\n").replace('\r', "\n").lines() {
+        if let Some(command) = graph_export_command(line) {
+            exports.push(parse_graph_export(command, line.trim(), cwd)?);
+        } else {
+            kept.push(line.to_string());
+        }
+    }
+    Ok(ExtractedGraphExports {
+        code: kept.join("\n"),
+        exports,
+    })
+}
+
+fn graph_export_command(line: &str) -> Option<&str> {
+    let mut rest = line.trim_start();
+    if let Some(after_dot) = rest.strip_prefix('.') {
+        rest = after_dot.trim_start();
+    }
+    if starts_with_ascii_ci(rest, "quietly") {
+        let after = &rest["quietly".len()..];
+        if after
+            .chars()
+            .next()
+            .map(char::is_whitespace)
+            .unwrap_or(false)
+        {
+            rest = after.trim_start();
+        }
+    }
+    if !starts_with_ascii_ci(rest, "graph") {
+        return None;
+    }
+    let after_graph = &rest["graph".len()..];
+    if !after_graph
+        .chars()
+        .next()
+        .map(char::is_whitespace)
+        .unwrap_or(false)
+    {
+        return None;
+    }
+    let rest = after_graph.trim_start();
+    if !starts_with_ascii_ci(rest, "export") {
+        return None;
+    }
+    let after_export = &rest["export".len()..];
+    if !after_export.is_empty()
+        && !after_export
+            .chars()
+            .next()
+            .map(char::is_whitespace)
+            .unwrap_or(false)
+    {
+        return None;
+    }
+    Some(after_export.trim_start())
+}
+
+fn parse_graph_export(command: &str, original_line: &str, cwd: &str) -> Result<GraphExportRequest> {
+    let (path_text, options) = parse_graph_export_path(command)
+        .ok_or_else(|| format!("failed to parse graph export path: {original_line}"))?;
+    let name = parse_name_option(options);
+    let replace = has_option_word(options, "replace");
+    let option_format = parse_as_option(options);
+    let requested_format = graph_format(&path_text, option_format.as_deref());
+    let rewritten_to_svg = requested_format.to_ascii_lowercase() != "svg";
+    let bitmap_format = BitmapFormat::from_graph_format(&requested_format);
+    let bitmap_path = bitmap_format.map(|format| bitmap_output_path(&path_text, format, cwd));
+    let target_text = if let Some(bitmap_path) = &bitmap_path {
+        with_svg_extension(&bitmap_path.to_string_lossy())
+    } else if rewritten_to_svg {
+        with_svg_extension(&path_text)
+    } else {
+        ensure_svg_extension(&path_text)
+    };
+    let target = resolve_export_path(&target_text, cwd);
+    Ok(GraphExportRequest {
+        original_line: original_line.to_string(),
+        target,
+        bitmap_path,
+        bitmap_format,
+        name,
+        replace,
+        requested_format,
+        rewritten_to_svg,
+    })
+}
+
+fn parse_graph_export_path(command: &str) -> Option<(String, &str)> {
+    let trimmed = command.trim_start();
+    let quote = trimmed
+        .chars()
+        .next()
+        .filter(|ch| *ch == '"' || *ch == '\'');
+    if let Some(quote) = quote {
+        let mut escaped = false;
+        let mut end = None;
+        for (idx, ch) in trimmed.char_indices().skip(1) {
+            if ch == quote {
+                if escaped {
+                    escaped = false;
+                    continue;
+                }
+                end = Some(idx);
+                break;
+            }
+            escaped = ch == '\\' && !escaped;
+        }
+        let end = end?;
+        let path = trimmed[1..end].to_string();
+        let rest = trimmed[end + quote.len_utf8()..].trim_start();
+        let options = rest.strip_prefix(',').unwrap_or("").trim_start();
+        Some((path, options))
+    } else {
+        let split = trimmed
+            .char_indices()
+            .find(|(_, ch)| ch.is_whitespace() || *ch == ',')
+            .map(|(idx, _)| idx)
+            .unwrap_or(trimmed.len());
+        if split == 0 {
+            return None;
+        }
+        let path = trimmed[..split].to_string();
+        let rest = trimmed[split..].trim_start();
+        let options = rest.strip_prefix(',').unwrap_or("").trim_start();
+        Some((path, options))
+    }
+}
+
+fn parse_name_option(options: &str) -> Option<String> {
+    parse_parenthesized_option(options, "name")
+}
+
+fn parse_as_option(options: &str) -> Option<String> {
+    parse_parenthesized_option(options, "as").map(|value| value.to_ascii_lowercase())
+}
+
+fn parse_parenthesized_option(options: &str, option: &str) -> Option<String> {
+    let lower = options.to_ascii_lowercase();
+    let needle = format!("{option}(");
+    let start = lower.find(&needle)? + needle.len();
+    let end = options[start..].find(')')? + start;
+    let value = options[start..end].trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.to_string())
+    }
+}
+
+fn has_option_word(options: &str, option: &str) -> bool {
+    options
+        .split(|ch: char| ch.is_whitespace() || ch == ',')
+        .any(|part| part.eq_ignore_ascii_case(option))
+}
+
+fn graph_format(path: &str, option_format: Option<&str>) -> String {
+    option_format
+        .map(ToString::to_string)
+        .or_else(|| {
+            Path::new(path)
+                .extension()
+                .and_then(|value| value.to_str())
+                .map(|value| value.to_ascii_lowercase())
         })
-        .collect::<Vec<_>>()
-        .join("\n")
+        .unwrap_or_else(|| "svg".to_string())
+}
+
+fn with_svg_extension(path: &str) -> String {
+    let path = Path::new(path);
+    let mut out = path.to_path_buf();
+    out.set_extension("svg");
+    out.to_string_lossy().to_string()
+}
+
+fn ensure_svg_extension(path: &str) -> String {
+    if Path::new(path).extension().is_some() {
+        path.to_string()
+    } else {
+        with_svg_extension(path)
+    }
+}
+
+fn resolve_export_path(path: &str, cwd: &str) -> PathBuf {
+    let path = PathBuf::from(path);
+    if path.is_absolute() {
+        path
+    } else if !cwd.trim().is_empty() {
+        PathBuf::from(cwd.trim()).join(path)
+    } else {
+        env::current_dir()
+            .unwrap_or_else(|_| env::temp_dir())
+            .join(path)
+    }
+}
+
+fn bitmap_output_path(path: &str, format: BitmapFormat, cwd: &str) -> PathBuf {
+    let mut out = resolve_export_path(path, cwd);
+    let ext = out
+        .extension()
+        .and_then(|value| value.to_str())
+        .map(|value| value.to_ascii_lowercase());
+    let ext_matches = match (format, ext.as_deref()) {
+        (BitmapFormat::Png, Some("png")) => true,
+        (BitmapFormat::Jpg, Some("jpg" | "jpeg")) => true,
+        _ => false,
+    };
+    if !ext_matches {
+        out.set_extension(format.extension());
+    }
+    out
+}
+
+fn starts_with_ascii_ci(value: &str, prefix: &str) -> bool {
+    value
+        .get(..prefix.len())
+        .map(|part| part.eq_ignore_ascii_case(prefix))
+        .unwrap_or(false)
 }
 
 #[derive(Clone)]
 struct GraphExport {
     name: String,
     svg: PathBuf,
+    png: Option<PathBuf>,
+    file: Option<PathBuf>,
+    format: Option<String>,
 }
 
 fn export_graphs(state: &AppState, session: &Arc<StataSession>) -> Vec<GraphExport> {
@@ -1018,11 +1310,161 @@ fn export_graphs(state: &AppState, session: &Arc<StataSession>) -> Vec<GraphExpo
             out.push(GraphExport {
                 name: name.clone(),
                 svg,
+                png: None,
+                file: None,
+                format: None,
             });
         }
     }
     let _ = session.execute("quietly _gr_list clear", false);
     out
+}
+
+fn export_requested_graphs(
+    _state: &AppState,
+    session: &Arc<StataSession>,
+    requests: &[GraphExportRequest],
+) -> (Vec<GraphExport>, Vec<String>) {
+    let names = current_graph_names(session);
+    let mut out = Vec::new();
+    let mut notes = Vec::new();
+    for request in requests {
+        if let Some(parent) = request.target.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        let graph_name = request.name.clone().or_else(|| names.first().cloned());
+        let mut options = Vec::new();
+        if let Some(name) = &graph_name {
+            options.push(format!("name({name})"));
+        }
+        if request.replace {
+            options.push("replace".to_string());
+        }
+        let cmd = if options.is_empty() {
+            format!(
+                "quietly graph export \"{}\"",
+                escape_stata_path(&request.target.to_string_lossy())
+            )
+        } else {
+            format!(
+                "quietly graph export \"{}\", {}",
+                escape_stata_path(&request.target.to_string_lossy()),
+                options.join(" ")
+            )
+        };
+        let result = session.execute(&cmd, false);
+        if result.success && request.target.exists() {
+            let mut png = None;
+            let mut file = None;
+            let mut format = None;
+            if let (Some(bitmap_path), Some(bitmap_format)) =
+                (&request.bitmap_path, request.bitmap_format)
+            {
+                match convert_svg_to_bitmap(&request.target, bitmap_path, bitmap_format) {
+                    Ok(()) => {
+                        notes.push(format!(
+                            "graph export requested {label}; exported SVG and converted bitmap: {path}",
+                            label = bitmap_format.label(),
+                            path = bitmap_path.to_string_lossy()
+                        ));
+                        file = Some(bitmap_path.clone());
+                        format = Some(bitmap_format.extension().to_string());
+                        if bitmap_format == BitmapFormat::Png {
+                            png = Some(bitmap_path.clone());
+                        }
+                    }
+                    Err(err) => {
+                        notes.push(format!(
+                            "graph export requested {label}, but SVG-to-{label} conversion failed: {err}. SVG kept: {path}",
+                            label = bitmap_format.label(),
+                            path = request.target.to_string_lossy()
+                        ));
+                    }
+                }
+            } else if request.rewritten_to_svg {
+                notes.push(format!(
+                    "graph export requested {format} output, exported SVG instead: {path}",
+                    format = request.requested_format,
+                    path = request.target.to_string_lossy()
+                ));
+            }
+            out.push(GraphExport {
+                name: graph_name.unwrap_or_else(|| "Graph".to_string()),
+                svg: request.target.clone(),
+                png,
+                file,
+                format,
+            });
+        }
+    }
+    let _ = session.execute("quietly _gr_list clear", false);
+    (out, notes)
+}
+
+fn current_graph_names(session: &Arc<StataSession>) -> Vec<String> {
+    let _ = session.execute("quietly _gr_list list", false);
+    let result = session.execute("display \"`r(_grlist)'\"", false);
+    parse_graph_names(&result.output)
+}
+
+fn convert_svg_to_bitmap(svg: &Path, dest: &Path, format: BitmapFormat) -> Result<()> {
+    if let Some(parent) = dest.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create bitmap output directory: {err}"))?;
+    }
+    let mut options = resvg::usvg::Options {
+        resources_dir: fs::canonicalize(svg)
+            .ok()
+            .and_then(|path| path.parent().map(Path::to_path_buf)),
+        ..resvg::usvg::Options::default()
+    };
+    options.fontdb_mut().load_system_fonts();
+    let svg_data = fs::read(svg).map_err(|err| format!("failed to read SVG: {err}"))?;
+    let tree = resvg::usvg::Tree::from_data(&svg_data, &options)
+        .map_err(|err| format!("failed to parse SVG: {err}"))?;
+    let size = tree.size().to_int_size();
+    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())
+        .ok_or_else(|| "failed to create bitmap buffer".to_string())?;
+    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let width = pixmap.width();
+    let height = pixmap.height();
+    let rgba = pixmap.take_demultiplied();
+    match format {
+        BitmapFormat::Png => image::save_buffer_with_format(
+            dest,
+            &rgba,
+            width,
+            height,
+            image::ColorType::Rgba8,
+            image::ImageFormat::Png,
+        )
+        .map_err(|err| format!("failed to write PNG: {err}")),
+        BitmapFormat::Jpg => {
+            let rgb = rgba_to_rgb_on_white(&rgba);
+            image::save_buffer_with_format(
+                dest,
+                &rgb,
+                width,
+                height,
+                image::ColorType::Rgb8,
+                image::ImageFormat::Jpeg,
+            )
+            .map_err(|err| format!("failed to write JPG: {err}"))
+        }
+    }
+}
+
+fn rgba_to_rgb_on_white(rgba: &[u8]) -> Vec<u8> {
+    let mut rgb = Vec::with_capacity(rgba.len() / 4 * 3);
+    for pixel in rgba.chunks_exact(4) {
+        let alpha = pixel[3] as u16;
+        for channel in &pixel[..3] {
+            let channel = *channel as u16;
+            let composited = (channel * alpha + 255 * (255 - alpha) + 127) / 255;
+            rgb.push(composited as u8);
+        }
+    }
+    rgb
 }
 
 fn parse_graph_names(output: &str) -> Vec<String> {
@@ -1540,7 +1982,8 @@ fn unique_id() -> String {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis())
         .unwrap_or(0);
-    format!("{}_{}", millis, std::process::id())
+    let counter = UNIQUE_COUNTER.fetch_add(1, Ordering::Relaxed);
+    format!("{}_{}_{}", millis, std::process::id(), counter)
 }
 
 fn paths_to_strings(paths: &[PathBuf]) -> Vec<String> {
@@ -1554,11 +1997,18 @@ fn graph_values(graphs: &[GraphExport]) -> Vec<Value> {
     graphs
         .iter()
         .map(|graph| {
-            json!({
+            let mut value = json!({
                 "name": graph.name,
                 "svg": graph.svg.to_string_lossy().to_string(),
-                "png": Value::Null
-            })
+                "png": graph.png.as_ref().map(|path| path.to_string_lossy().to_string())
+            });
+            if let Some(file) = &graph.file {
+                value["file"] = json!(file.to_string_lossy().to_string());
+            }
+            if let Some(format) = &graph.format {
+                value["format"] = json!(format);
+            }
+            value
         })
         .collect()
 }
@@ -1666,6 +2116,7 @@ mod tests {
             command.command,
             format!("do \"{}\"", escape_stata_path(&temp_file.to_string_lossy()))
         );
+        assert!(command.graph_exports.is_empty());
         fs::remove_file(temp_file).unwrap();
     }
 
@@ -1674,7 +2125,159 @@ mod tests {
         let state = test_state();
         let command = prepare_command_with_cwd(&state, "", "analysis.do", "/tmp/work").unwrap();
 
-        assert_eq!(command.command, "cd \"/tmp/work\"\ndo \"analysis.do\"");
+        let temp_file = command.temp_file.as_ref().unwrap();
+        let temp_code = fs::read_to_string(temp_file).unwrap();
+        assert_eq!(temp_code, "cd \"/tmp/work\"\ndo \"analysis.do\"");
+        assert_eq!(
+            command.command,
+            format!("do \"{}\"", escape_stata_path(&temp_file.to_string_lossy()))
+        );
+        assert!(command.graph_exports.is_empty());
+        fs::remove_file(temp_file).unwrap();
+    }
+
+    #[test]
+    fn recognizes_dot_and_quietly_graph_export_lines() {
+        assert!(graph_export_command(". graph export \"a.svg\", replace").is_some());
+        assert!(graph_export_command("   quietly graph export \"a.svg\", replace").is_some());
+
+        let extracted = extract_graph_exports(
+            "sysuse auto, clear\n. graph export \"a.svg\", replace\n quietly graph export \"b.svg\", replace",
+            "",
+        )
+        .unwrap();
+
+        assert_eq!(extracted.code, "sysuse auto, clear");
+        assert_eq!(extracted.exports.len(), 2);
+        assert_eq!(extracted.exports[0].target.file_name().unwrap(), "a.svg");
+        assert_eq!(extracted.exports[1].target.file_name().unwrap(), "b.svg");
+    }
+
+    #[test]
+    fn parses_user_export_path_and_name_option() {
+        let request = parse_graph_export(
+            "\"figures/result.svg\", replace name(my_graph)",
+            "graph export \"figures/result.svg\", replace name(my_graph)",
+            "/tmp/project",
+        )
+        .unwrap();
+
+        assert_eq!(
+            request.target,
+            PathBuf::from("/tmp/project/figures/result.svg")
+        );
+        assert_eq!(request.name.as_deref(), Some("my_graph"));
+        assert!(request.replace);
+        assert_eq!(request.requested_format, "svg");
+        assert!(!request.rewritten_to_svg);
+    }
+
+    #[test]
+    fn rewrites_bitmap_graph_exports_to_svg_path() {
+        for path in ["plot.png", "plot.jpg", "plot.jpeg", "plot.tif", "plot.tiff"] {
+            let request = parse_graph_export(
+                &format!("\"{path}\", replace name(g1)"),
+                "graph export bitmap",
+                "/tmp/project",
+            )
+            .unwrap();
+
+            assert_eq!(
+                request.target,
+                PathBuf::from("/tmp/project")
+                    .join(path)
+                    .with_extension("svg")
+            );
+            assert_eq!(request.name.as_deref(), Some("g1"));
+            assert!(request.rewritten_to_svg);
+            if path.ends_with(".png") {
+                assert_eq!(request.bitmap_format, Some(BitmapFormat::Png));
+                assert_eq!(
+                    request.bitmap_path.as_ref().unwrap(),
+                    &PathBuf::from("/tmp/project/plot.png")
+                );
+            } else if path.ends_with(".jpg") || path.ends_with(".jpeg") {
+                assert_eq!(request.bitmap_format, Some(BitmapFormat::Jpg));
+                assert_eq!(
+                    request.bitmap_path.as_ref().unwrap(),
+                    &PathBuf::from("/tmp/project").join(path)
+                );
+            } else {
+                assert_eq!(request.bitmap_format, None);
+                assert_eq!(request.bitmap_path, None);
+            }
+        }
+    }
+
+    #[test]
+    fn keeps_auto_graph_export_when_no_explicit_export_exists() {
+        let state = test_state();
+        let command =
+            prepare_command_with_cwd(&state, "sysuse auto, clear\nscatter price mpg", "", "")
+                .unwrap();
+
+        assert!(command.graph_exports.is_empty());
+        let temp_file = command.temp_file.as_ref().unwrap();
+        let temp_code = fs::read_to_string(temp_file).unwrap();
+        assert_eq!(temp_code, "sysuse auto, clear\nscatter price mpg");
+        fs::remove_file(temp_file).unwrap();
+    }
+
+    #[test]
+    fn cwd_multiline_code_uses_temp_do_file_and_preserves_cd_prefix() {
+        let state = test_state();
+        let command = prepare_command_with_cwd(
+            &state,
+            "sysuse auto, clear\n. graph export \"out.png\", replace\nsummarize price",
+            "",
+            "/tmp/work",
+        )
+        .unwrap();
+
+        let temp_file = command.temp_file.as_ref().unwrap();
+        let temp_code = fs::read_to_string(temp_file).unwrap();
+        assert_eq!(
+            temp_code,
+            "cd \"/tmp/work\"\nsysuse auto, clear\nsummarize price"
+        );
+        assert_eq!(
+            command.command,
+            format!("do \"{}\"", escape_stata_path(&temp_file.to_string_lossy()))
+        );
+        assert_eq!(command.graph_exports.len(), 1);
+        assert_eq!(
+            command.graph_exports[0].target,
+            PathBuf::from("/tmp/work/out.svg")
+        );
+        assert_eq!(
+            command.graph_exports[0].bitmap_path.as_ref().unwrap(),
+            &PathBuf::from("/tmp/work/out.png")
+        );
+        fs::remove_file(temp_file).unwrap();
+    }
+
+    #[test]
+    fn converts_svg_to_png_and_jpg() {
+        let root = env::temp_dir().join(format!("stata-ai-skill-convert-{}", unique_id()));
+        fs::create_dir_all(&root).unwrap();
+        let svg = root.join("input.svg");
+        let png = root.join("output.png");
+        let jpg = root.join("output.jpg");
+        fs::write(
+            &svg,
+            r##"<svg xmlns="http://www.w3.org/2000/svg" width="24" height="16"><rect width="24" height="16" fill="#3366cc"/></svg>"##,
+        )
+        .unwrap();
+
+        convert_svg_to_bitmap(&svg, &png, BitmapFormat::Png).unwrap();
+        convert_svg_to_bitmap(&svg, &jpg, BitmapFormat::Jpg).unwrap();
+
+        let png_bytes = fs::read(&png).unwrap();
+        let jpg_bytes = fs::read(&jpg).unwrap();
+        assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(jpg_bytes.starts_with(&[0xff, 0xd8, 0xff]));
+
+        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
