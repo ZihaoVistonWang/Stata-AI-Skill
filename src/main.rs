@@ -301,7 +301,7 @@ fn discover_stata(configured: Option<&Path>) -> Discovery {
             "Stata installations were detected. Ask the user which installation to use before configuring the service.".to_string()
         } else if needs_configuration {
             format!(
-                "Stata was not found automatically. Ask permission to install the bundled aiskill command, then guide the user through the two-stage aiskill setup flow. Manual path examples: {}.",
+                "Stata was not found automatically. Create an aiskill installation session, give the user the generated installation.do command, and wait for the selected GUI Stata to report the result. Manual path examples: {}.",
                 example_paths().join(" or ")
             )
         } else if needs_license {
@@ -1089,7 +1089,7 @@ fn status_json(state: &AppState) -> String {
         });
     let next_action = match phase.as_str() {
         "selection_required" => "ask_user_to_select_candidate",
-        "manual_setup_required" => "ask_permission_to_install_aiskill",
+        "manual_setup_required" => "start_aiskill_install_session",
         "awaiting_install_result" => "wait_for_installation_result",
         "awaiting_aiskill_setup" => "ask_user_to_run_aiskill_setup",
         "configuring" => "wait_for_configuration",
@@ -3359,6 +3359,7 @@ mod tests {
         let before = state.setup.lock().unwrap().setup_tokens[0].value.clone();
         let json: Value = serde_json::from_str(&status_json(&state)).unwrap();
         assert_eq!(json["setup"]["phase"], "manual_setup_required");
+        assert_eq!(json["setup"]["nextAction"], "start_aiskill_install_session");
         let after = state.setup.lock().unwrap().setup_tokens[0].value.clone();
         assert_eq!(before, after);
     }

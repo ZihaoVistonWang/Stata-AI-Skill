@@ -137,7 +137,7 @@ agent actions are:
 | `setup.phase` | Agent action |
 |---|---|
 | `selection_required` | Ask the user to choose a detected Stata installation, then call `/configure` |
-| `manual_setup_required` | Ask permission to install the bundled `aiskill` command and begin the two-stage setup flow |
+| `manual_setup_required` | Immediately create an install session and give the user the generated `installation.do` command |
 | `awaiting_install_result` | Wait for the user to run the first copied command; poll `/status` every two seconds in windows no longer than one minute |
 | `awaiting_aiskill_setup` | Give the user the second command, `aiskill setup` |
 | `configuring` | Continue polling until `ready` or `configuration_failed` |
@@ -153,6 +153,10 @@ host agent's best structured question tool to show the recommended candidate,
 other candidates, and a manual-setup choice. If no structured question tool is
 available, ask in chat and wait for an explicit reply.
 
+If the user chooses manual setup, treat that selection as the complete choice:
+call `POST /setup/install-session` immediately and show its returned command.
+Do not ask a second question about installing `aiskill`.
+
 After confirmation, configure and initialize through the already running
 service; no restart is needed:
 
@@ -167,26 +171,10 @@ updated status with `sessionActive: true` and `setup.phase: "ready"`.
 
 ### Manual Two-Stage `aiskill setup`
 
-Use this only when automatic discovery finds no candidates. `aiskill` is a
-first-party Stata command bundled with this Skill. Installing it writes into
-the user's local Stata ado directory, so obtain explicit permission first,
-using the same structured confirmation policy as the Lianxh installation
-below.
-
-Fallback wording:
-
-```text
-自动探测没有找到 Stata。
-
-Stata AI Skill 自带 aiskill 配置命令。安装后会写入本机 Stata ado 目录，
-用于把当前打开的 GUI Stata 安装信息发送给 19522 服务。
-
-是否允许安装 aiskill？
-- 安装：继续两阶段配置
-- 跳过：不修改 Stata ado 环境
-```
-
-Only after approval, create an installation session:
+Use this when automatic discovery finds no candidates or the user explicitly
+chooses manual setup. That choice already starts the manual workflow; do not
+ask for a second installation confirmation. Immediately create an installation
+session:
 
 ```bash
 curl -s -X POST http://127.0.0.1:19522/setup/install-session
@@ -198,10 +186,16 @@ Copy or display the returned `command`, normally:
 do "`c(tmpdir)'/installation.do"
 ```
 
-The script installs the bundled local package and reports success or failure
-to `GET /installed` on the same service port. Poll JSON `/status`; do not issue
-the second command until the phase becomes `awaiting_aiskill_setup`. Then ask
-the user to run this in a separately opened GUI Stata:
+Tell the user to run this command in the specific GUI Stata installation they
+want the Skill to use. The command runs `net install` inside that Stata process,
+so Stata itself selects the correct PERSONAL/PLUS ado directory for that user;
+the agent and background service must not guess or write the ado path directly.
+
+The 19522 service remains alive in `awaiting_install_result` and receives the
+script's success or failure callback at `GET /installed`. Poll JSON `/status`
+in the background; do not issue the second command until the phase becomes
+`awaiting_aiskill_setup`. Then ask the user to run this in the same separately
+opened GUI Stata:
 
 ```stata
 aiskill setup

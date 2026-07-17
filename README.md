@@ -100,11 +100,12 @@ the agent asks the user to confirm a candidate before calling `POST /configure`.
 The running service saves the choice and initializes Stata without a restart.
 
 If discovery finds no candidate, `/status` returns
-`setup.phase: "manual_setup_required"`. After explicit permission, the agent
-starts a two-stage fallback on the same port: install the bundled `aiskill`
-Stata command, wait for its `/installed` callback, and then ask the user to run
-`aiskill setup` in a separately opened GUI Stata. No 16886–16895 auxiliary
-ports or VS Code runtime are used.
+`setup.phase: "manual_setup_required"`. The agent immediately creates an
+installation session and gives the user ``do "`c(tmpdir)'/installation.do"``.
+Running that command in the selected GUI Stata installs `aiskill` according to
+that Stata user's own ado-path configuration. The 19522 service waits for the
+`/installed` callback and then asks the user to run `aiskill setup`. No
+16886–16895 auxiliary ports or VS Code runtime are used.
 
 If Stata is found but the license file is missing, `/status` returns
 `needsLicense: true`, `missing: "stata_license"`, and the expected `licensePath`.
