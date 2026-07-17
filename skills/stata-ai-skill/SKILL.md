@@ -1,6 +1,6 @@
 ---
 name: stata-ai-skill
-description: Run Stata code and statistical analysis through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, econometrics workflows, or search Stata articles and cookbook-style resources with lianxh. No VS Code, Node.js, or Python runtime is required on the user side.
+description: Run, configure, reset, or reconfigure Stata through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, econometrics workflows, switch the configured Stata installation, redo Skill setup, clear Stata AI Skill configuration, or search Stata articles and cookbook-style resources with lianxh. No VS Code, Node.js, or Python runtime is required on the user side.
 ---
 
 # Stata AI Skill
@@ -100,6 +100,40 @@ executable path. Examples:
 ```
 
 ## Agent Workflow
+
+### Reset And Reconfigure
+
+Interpret requests such as "reconfigure this Skill", "reset the Stata Skill",
+"重新配置该技能", "重置 Stata 配置", "换一个 Stata", or "start setup
+over" as an explicit request to delete the persisted Stata AI Skill
+configuration and run setup again. The request itself authorizes this reset;
+do not ask for another confirmation.
+
+If the service is online, reset it in place:
+
+```bash
+curl -s -X POST http://127.0.0.1:19522/configure/reset
+```
+
+This removes the persisted config file and returns `restartRequired: true`.
+Wait for the service to stop, then restart it with the resolved executable and
+no `--stata-path` argument. Stopping the process safely closes the embedded
+Stata session and clears install/setup tokens and phases. It does not uninstall
+Stata, delete ado packages, or alter the Stata license.
+
+If the service is offline, use the resolved executable and then start it:
+
+```bash
+stata-ai-skill config reset
+stata-ai-skill serve
+```
+
+After restarting, read `/status` and follow the ordinary setup flow below. A
+detected candidate must be shown to the user for explicit
+selection even when there is only one; no candidate enters the manual two-stage
+flow. If reset returns HTTP 409 because Stata is busy, wait for the current
+execution to finish and retry once. Do not use `aiskill setup, force` as a
+substitute because it leaves the old persisted selection in place.
 
 1. Check whether the service is running:
 

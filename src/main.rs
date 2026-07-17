@@ -77,9 +77,14 @@ fn run() -> Result<()> {
             println!("{}", config.to_toml());
             Ok(())
         }
+        Some("config") if args.get(2).map(String::as_str) == Some("reset") => {
+            remove_persisted_config(&paths)?;
+            println!("Stata AI Skill configuration reset.");
+            Ok(())
+        }
         _ => {
             eprintln!(
-                "Usage:\n  stata-ai-skill serve [--stata-path <path>] [--port <port>]\n  stata-ai-skill config set [--stata-path <path>] [--port <port>]\n  stata-ai-skill config show"
+                "Usage:\n  stata-ai-skill serve [--stata-path <path>] [--port <port>]\n  stata-ai-skill config set [--stata-path <path>] [--port <port>]\n  stata-ai-skill config show\n  stata-ai-skill config reset"
             );
             Ok(())
         }
@@ -228,6 +233,17 @@ impl AppConfig {
             ));
         }
         out
+    }
+}
+
+fn remove_persisted_config(paths: &AppPaths) -> Result<()> {
+    match fs::remove_file(&paths.config_file) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(format!(
+            "failed to remove {}: {error}",
+            paths.config_file.display()
+        )),
     }
 }
 
@@ -906,6 +922,14 @@ fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> 
         ("GET", "/status") => (200, status_json(&state), "application/json"),
         ("POST", "/execute") => { let (status, body) = execute_json(&state, body); (status, body, "application/json") },
         ("POST", "/configure") => { let (status, body) = configure_json(&state, body); (status, body, "application/json") },
+        ("POST", "/configure/reset") => {
+            if let Err(error) = validate_setup_headers(&headers, &state) {
+                (403, json_error(&error), "application/json")
+            } else {
+                let (status, body) = reset_configuration_json(&state);
+                (status, body, "application/json")
+            }
+        },
         ("POST", "/setup/install-session") => {
             if let Err(error) = validate_setup_headers(&headers, &state) {
                 (403, json_error(&error), "application/json")
@@ -935,7 +959,7 @@ fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> 
         ("OPTIONS", _) => (204, String::new(), "application/json"),
         _ => (
             404,
-            r#"{"success":false,"error":"Not Found. Available endpoints: GET /status, POST /configure, POST /setup/install-session, GET /installed, GET /setup, POST /execute, POST /break, POST /shutdown"}"#.to_string(),
+            r#"{"success":false,"error":"Not Found. Available endpoints: GET /status, POST /configure, POST /configure/reset, POST /setup/install-session, GET /installed, GET /setup, POST /execute, POST /break, POST /shutdown"}"#.to_string(),
             "application/json",
         ),
     };
@@ -1298,6 +1322,30 @@ fn configure_json(state: &AppState, body: &str) -> (u16, String) {
             (422, json!({ "success": false, "error": error, "status": serde_json::from_str::<Value>(&status_json(state)).unwrap_or(Value::Null) }).to_string())
         }
     }
+}
+
+fn reset_configuration_json(state: &AppState) -> (u16, String) {
+    if state.busy.load(Ordering::SeqCst) {
+        return (
+            409,
+            json_error("Stata is busy; wait for execution to finish before reconfiguring"),
+        );
+    }
+    if let Err(error) = remove_persisted_config(&state.paths) {
+        return (500, json_error(&error));
+    }
+    state.shutting_down.store(true, Ordering::SeqCst);
+    (
+        200,
+        json!({
+            "success": true,
+            "reset": true,
+            "restartRequired": true,
+            "nextAction": "restart_service_and_read_status",
+            "message": "Persistent configuration cleared. Restart the service to begin setup again."
+        })
+        .to_string(),
+    )
 }
 
 fn configure_path(state: &AppState, path: PathBuf) -> Result<()> {
@@ -3362,6 +3410,72 @@ mod tests {
         assert_eq!(json["setup"]["nextAction"], "start_aiskill_install_session");
         let after = state.setup.lock().unwrap().setup_tokens[0].value.clone();
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn reset_configuration_deletes_persistence_and_requests_restart() {
+        let state = test_state();
+        let persisted = AppConfig {
+            port: 19522,
+            stata_path: Some(PathBuf::from("/previous/Stata.app")),
+        };
+        persisted.save(&state.paths).unwrap();
+        state.runtime.lock().unwrap().config = persisted;
+        {
+            let mut setup = state.setup.lock().unwrap();
+            setup.phase = Some("awaiting_aiskill_setup".to_string());
+            setup.install_token = Some(SetupToken {
+                value: "old-install-token".to_string(),
+                created_at: Instant::now(),
+            });
+            setup.setup_tokens.push(SetupToken {
+                value: "old-setup-token".to_string(),
+                created_at: Instant::now(),
+            });
+        }
+
+        let (status_code, body) = reset_configuration_json(&state);
+        assert_eq!(status_code, 200);
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["success"], true);
+        assert_eq!(response["reset"], true);
+        assert_eq!(response["restartRequired"], true);
+        assert_eq!(response["nextAction"], "restart_service_and_read_status");
+        assert!(!state.paths.config_file.exists());
+        assert!(state.shutting_down.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn reset_configuration_refuses_while_stata_is_busy() {
+        let state = test_state();
+        state.busy.store(true, Ordering::SeqCst);
+        let (status_code, body) = reset_configuration_json(&state);
+        assert_eq!(status_code, 409);
+        assert!(body.contains("wait for execution to finish"));
+    }
+
+    #[test]
+    fn config_reset_is_idempotent() {
+        let state = test_state();
+        AppConfig {
+            port: 19522,
+            stata_path: Some(PathBuf::from("/previous/Stata.app")),
+        }
+        .save(&state.paths)
+        .unwrap();
+        remove_persisted_config(&state.paths).unwrap();
+        remove_persisted_config(&state.paths).unwrap();
+        assert!(!state.paths.config_file.exists());
+    }
+
+    #[test]
+    fn skill_maps_reconfigure_requests_to_persistent_reset() {
+        let skill = fs::read_to_string("skills/stata-ai-skill/SKILL.md").unwrap();
+        assert!(skill.contains("重新配置该技能"));
+        assert!(skill.contains("POST http://127.0.0.1:19522/configure/reset"));
+        assert!(skill.contains("stata-ai-skill config reset"));
+        assert!(skill.contains("do not ask for another confirmation"));
+        assert!(skill.contains("Do not use `aiskill setup, force` as a"));
     }
 
     #[test]

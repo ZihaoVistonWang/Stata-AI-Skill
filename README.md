@@ -138,6 +138,7 @@ Accepted examples:
 - `GET /status`
 - `GET /status?format=stata` for the `AISKILL/1` text handshake
 - `POST /configure` with `{ "stataPath": "..." }`
+- `POST /configure/reset` to delete persisted configuration and request a clean service restart
 - `POST /setup/install-session`
 - `GET /installed?aiskill=0|1&token=...`
 - `GET /setup?...` from the bundled `aiskill setup` command
