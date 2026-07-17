@@ -61,6 +61,18 @@ fn dist() -> Result<()> {
         )
     })?;
 
+    if platform_dir == "macos-arm64" {
+        copy_file(
+            &source,
+            &root
+                .join("skills")
+                .join("stata-ai-skill")
+                .join("bin")
+                .join("macos")
+                .join(exe_name),
+        )?;
+    }
+
     let skill_dir = root.join("skills").join("stata-ai-skill");
     copy_file(
         &root.join("scripts").join("discover_stata_windows.bat"),

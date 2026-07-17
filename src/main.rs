@@ -17,7 +17,7 @@ use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_1252};
 use serde_json::{json, Value};
 
 const SERVICE_NAME: &str = "stata-ai-skill";
-const SKILL_VERSION: &str = "202607060001";
+const SKILL_VERSION: &str = "v1.1";
 const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
@@ -3523,6 +3523,9 @@ mod tests {
     #[test]
     fn bundled_aiskill_command_has_no_saio_or_auxiliary_port_scan() {
         let ado = fs::read_to_string("stata/aiskill/aiskill.ado").unwrap();
+        assert_eq!(SKILL_VERSION, "v1.1");
+        assert!(ado.starts_with("*! version v1.1 "));
+        assert!(ado.contains("local client_version \"v1.1\""));
         assert!(!ado.to_ascii_lowercase().contains("saio"));
         assert!(!ado.contains("16886"));
         assert!(!ado.contains("16895"));
@@ -3530,6 +3533,10 @@ mod tests {
             .to_ascii_lowercase()
             .contains("syntax [anything(name=command)] [, port"));
         assert!(ado.contains("127.0.0.1:19522"));
+        let help = fs::read_to_string("stata/aiskill/aiskill.sthlp").unwrap();
+        assert!(help.contains("version v1.1"));
+        let skill = fs::read_to_string("skills/stata-ai-skill/SKILL.md").unwrap();
+        assert!(skill.contains("version: v1.1"));
     }
 
     #[test]

@@ -1,10 +1,10 @@
-*! version 1.0.0 17jul2026
+*! version v1.1 17jul2026
 
 program define aiskill, rclass
     version 13
     syntax [anything(name=command)] [, FORCE]
 
-    local client_version "1.0.0"
+    local client_version "v1.1"
     local protocol_version "1"
     local command = lower(strtrim(`"`command'"'))
     if `"`command'"' == "" local command "setup"
