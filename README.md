@@ -30,6 +30,14 @@ skills/
         stata-ai-skill.exe
       windows-arm64/
         stata-ai-skill.exe
+    scripts/
+      discover_stata_windows.bat
+    stata/
+      aiskill/
+        aiskill.ado
+        aiskill.sthlp
+        aiskill.pkg
+        stata.toc
 ```
 
 Agents should resolve the executable from
@@ -84,20 +92,19 @@ nohup ./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill serve > /tmp/stata-
 curl -s http://127.0.0.1:19523/status
 ```
 
-If Stata cannot be found, `/status` returns `needsConfiguration: true`. The
-agent should ask the user where the Stata app/program is installed and run:
+On macOS the service scans Applications; on Windows it runs the bundled
+`discover_stata_windows.bat`, which reads the 32-bit and 64-bit HKLM/HKCU
+uninstall registry views. Candidates are sorted by newest version and then
+MP, SE, BE, and IC. `/status` returns `setup.phase: "selection_required"` and
+the agent asks the user to confirm a candidate before calling `POST /configure`.
+The running service saves the choice and initializes Stata without a restart.
 
-```bash
-./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill config set --stata-path "/Applications/StataMP.app"
-./skills/stata-ai-skill/bin/macos-arm64/stata-ai-skill serve
-```
-
-Windows example:
-
-```powershell
-.\skills\stata-ai-skill\bin\windows\stata-ai-skill.exe config set --stata-path "C:\Program Files\Stata18\StataMP-64.exe"
-.\skills\stata-ai-skill\bin\windows\stata-ai-skill.exe serve
-```
+If discovery finds no candidate, `/status` returns
+`setup.phase: "manual_setup_required"`. After explicit permission, the agent
+starts a two-stage fallback on the same port: install the bundled `aiskill`
+Stata command, wait for its `/installed` callback, and then ask the user to run
+`aiskill setup` in a separately opened GUI Stata. No 16886–16895 auxiliary
+ports or VS Code runtime are used.
 
 If Stata is found but the license file is missing, `/status` returns
 `needsLicense: true`, `missing: "stata_license"`, and the expected `licensePath`.
@@ -128,6 +135,11 @@ Accepted examples:
 ## HTTP API
 
 - `GET /status`
+- `GET /status?format=stata` for the `AISKILL/1` text handshake
+- `POST /configure` with `{ "stataPath": "..." }`
+- `POST /setup/install-session`
+- `GET /installed?aiskill=0|1&token=...`
+- `GET /setup?...` from the bundled `aiskill setup` command
 - `POST /execute` with `{ "code": "...", "file": "...", "timeout": 30, "echo": false, "cwd": "..." }`
 - `POST /break`
 - `POST /shutdown`

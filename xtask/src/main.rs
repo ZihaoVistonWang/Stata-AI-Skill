@@ -61,6 +61,16 @@ fn dist() -> Result<()> {
         )
     })?;
 
+    let skill_dir = root.join("skills").join("stata-ai-skill");
+    copy_file(
+        &root.join("scripts").join("discover_stata_windows.bat"),
+        &skill_dir.join("scripts").join("discover_stata_windows.bat"),
+    )?;
+    copy_directory(
+        &root.join("stata").join("aiskill"),
+        &skill_dir.join("stata").join("aiskill"),
+    )?;
+
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -73,6 +83,39 @@ fn dist() -> Result<()> {
     }
 
     println!("Packaged {}", dest.display());
+    Ok(())
+}
+
+fn copy_file(source: &Path, destination: &Path) -> Result<()> {
+    if let Some(parent) = destination.parent() {
+        fs::create_dir_all(parent)
+            .map_err(|err| format!("failed to create {}: {err}", parent.display()))?;
+    }
+    fs::copy(source, destination).map_err(|err| {
+        format!(
+            "failed to copy {} to {}: {err}",
+            source.display(),
+            destination.display()
+        )
+    })?;
+    Ok(())
+}
+
+fn copy_directory(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)
+        .map_err(|err| format!("failed to create {}: {err}", destination.display()))?;
+    for entry in
+        fs::read_dir(source).map_err(|err| format!("failed to read {}: {err}", source.display()))?
+    {
+        let entry = entry.map_err(|err| format!("failed to read directory entry: {err}"))?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            copy_directory(&source_path, &destination_path)?;
+        } else {
+            copy_file(&source_path, &destination_path)?;
+        }
+    }
     Ok(())
 }
 

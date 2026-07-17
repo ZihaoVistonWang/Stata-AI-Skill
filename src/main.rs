@@ -4,11 +4,16 @@ use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+#[cfg(target_os = "windows")]
+use std::process::Command;
+#[cfg(target_os = "windows")]
+use std::process::Stdio;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_1252};
 use serde_json::{json, Value};
 
 const SERVICE_NAME: &str = "stata-ai-skill";
@@ -17,6 +22,8 @@ const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
+const SETUP_TOKEN_TTL: Duration = Duration::from_secs(600);
+const SETUP_PROTOCOL_VERSION: u8 = 1;
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type Result<T> = std::result::Result<T, String>;
@@ -231,6 +238,34 @@ fn parse_quoted_value(line: &str) -> Option<String> {
 }
 
 #[derive(Clone, Debug)]
+struct DiscoveryCandidate {
+    display_name: String,
+    selected_path: PathBuf,
+    library_path: PathBuf,
+    license_path: Option<PathBuf>,
+    license_found: bool,
+    edition: String,
+    version: Option<u32>,
+    source: String,
+}
+
+impl DiscoveryCandidate {
+    fn value(&self, recommended: bool) -> Value {
+        json!({
+            "displayName": self.display_name,
+            "path": self.selected_path.to_string_lossy(),
+            "libraryPath": self.library_path.to_string_lossy(),
+            "licensePath": self.license_path.as_ref().map(|path| path.to_string_lossy().to_string()),
+            "licenseFound": self.license_found,
+            "edition": self.edition,
+            "version": self.version,
+            "source": self.source,
+            "recommended": recommended
+        })
+    }
+}
+
+#[derive(Clone, Debug)]
 struct Discovery {
     library_path: Option<PathBuf>,
     license_path: Option<PathBuf>,
@@ -239,19 +274,22 @@ struct Discovery {
     needs_license: bool,
     message: String,
     examples: Vec<String>,
-    candidates: Vec<PathBuf>,
+    candidates: Vec<DiscoveryCandidate>,
+    error: Option<String>,
 }
 
 fn discover_stata(configured: Option<&Path>) -> Discovery {
-    let mut candidates = Vec::new();
-    if let Some(path) = configured {
-        candidates.extend(resolve_from_user_path(path));
-    }
-    candidates.extend(scan_common_paths());
-    let library_path = candidates.iter().find(|p| p.exists()).cloned();
+    let configured_candidates = configured.map(resolve_from_user_path).unwrap_or_default();
+    let configured_candidate = configured_candidates.first().cloned();
+    let (mut candidates, discovery_error) = scan_installations();
+    sort_candidates(&mut candidates);
+    deduplicate_candidates(&mut candidates);
+    let library_path = configured_candidate
+        .as_ref()
+        .map(|candidate| candidate.library_path.clone());
     let license_path = library_path.as_deref().and_then(expected_license_path);
     let license_found = license_path.as_ref().map(|p| p.exists()).unwrap_or(false);
-    let needs_configuration = library_path.is_none();
+    let needs_configuration = configured_candidate.is_none();
     let needs_license = library_path.is_some() && !license_found;
     Discovery {
         library_path,
@@ -259,9 +297,11 @@ fn discover_stata(configured: Option<&Path>) -> Discovery {
         license_found,
         needs_configuration,
         needs_license,
-        message: if needs_configuration {
+        message: if needs_configuration && !candidates.is_empty() {
+            "Stata installations were detected. Ask the user which installation to use before configuring the service.".to_string()
+        } else if needs_configuration {
             format!(
-                "Stata was not found automatically. Ask the user where the Stata app/program is installed. Examples: {}. Then run `stata-ai-skill config set --stata-path <path>`.",
+                "Stata was not found automatically. Ask permission to install the bundled aiskill command, then guide the user through the two-stage aiskill setup flow. Manual path examples: {}.",
                 example_paths().join(" or ")
             )
         } else if needs_license {
@@ -271,34 +311,160 @@ fn discover_stata(configured: Option<&Path>) -> Discovery {
         },
         examples: example_paths(),
         candidates,
+        error: discovery_error,
     }
 }
 
-fn resolve_from_user_path(path: &Path) -> Vec<PathBuf> {
+fn resolve_from_user_path(path: &Path) -> Vec<DiscoveryCandidate> {
     if is_library_path(path) {
-        return vec![path.to_path_buf()];
+        return vec![candidate_from_library(
+            path.to_path_buf(),
+            path.to_path_buf(),
+            "configured",
+        )];
     }
     #[cfg(target_os = "macos")]
     {
         if path.extension().and_then(|v| v.to_str()) == Some("app") {
-            return macos_libraries_in(&path.join("Contents").join("MacOS"));
+            return macos_candidates_for_app(path, "configured");
         }
         if path.is_dir() {
-            return macos_libraries_in(path);
+            let direct = macos_libraries_in(path)
+                .into_iter()
+                .map(|library| candidate_from_library(path.to_path_buf(), library, "configured"))
+                .collect::<Vec<_>>();
+            if !direct.is_empty() {
+                return direct;
+            }
+            if let Ok(entries) = fs::read_dir(path) {
+                return entries
+                    .flatten()
+                    .flat_map(|entry| macos_candidates_for_app(&entry.path(), "configured"))
+                    .collect();
+            }
         }
     }
     #[cfg(target_os = "windows")]
     {
         if path.is_file() {
             if let Some(parent) = path.parent() {
-                return windows_libraries_in(parent);
+                return windows_libraries_in(parent)
+                    .into_iter()
+                    .map(|library| {
+                        candidate_from_library(path.to_path_buf(), library, "configured")
+                    })
+                    .collect();
             }
         }
         if path.is_dir() {
-            return windows_libraries_in(path);
+            return windows_libraries_in(path)
+                .into_iter()
+                .map(|library| candidate_from_library(path.to_path_buf(), library, "configured"))
+                .collect();
         }
     }
     Vec::new()
+}
+
+fn candidate_from_library(
+    selected_path: PathBuf,
+    library_path: PathBuf,
+    source: &str,
+) -> DiscoveryCandidate {
+    let license_path = expected_license_path(&library_path);
+    let edition = edition_from_library(&library_path);
+    DiscoveryCandidate {
+        display_name: candidate_display_name(&selected_path, None, &edition),
+        selected_path,
+        library_path,
+        license_found: license_path
+            .as_ref()
+            .map(|path| path.exists())
+            .unwrap_or(false),
+        license_path,
+        edition,
+        version: None,
+        source: source.to_string(),
+    }
+}
+
+fn edition_from_library(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    for edition in ["mp", "se", "be", "ic"] {
+        if name.contains(&format!("-{edition}."))
+            || name.starts_with(&format!("{edition}-"))
+            || name.contains(&format!("stata{edition}"))
+        {
+            return edition.to_string();
+        }
+    }
+    String::new()
+}
+
+fn parse_numeric_version(values: &[&str]) -> Option<u32> {
+    for value in values {
+        let lower = value.to_ascii_lowercase();
+        if let Some(index) = lower.find("statanow").or_else(|| lower.find("stata")) {
+            let digits = lower[index..]
+                .chars()
+                .skip_while(|ch| !ch.is_ascii_digit())
+                .take_while(|ch| ch.is_ascii_digit())
+                .collect::<String>();
+            if let Ok(version) = digits.parse::<u32>() {
+                return Some(version);
+            }
+        }
+    }
+    None
+}
+
+fn candidate_display_name(path: &Path, version: Option<u32>, edition: &str) -> String {
+    let base = if let Some(version) = version {
+        format!("Stata {version}")
+    } else {
+        path.file_stem()
+            .and_then(|value| value.to_str())
+            .unwrap_or("Stata")
+            .to_string()
+    };
+    if edition.is_empty() || base.to_ascii_lowercase().ends_with(edition) {
+        base
+    } else {
+        format!("{base} {}", edition.to_ascii_uppercase())
+    }
+}
+
+fn edition_rank(edition: &str) -> usize {
+    ["mp", "se", "be", "ic"]
+        .iter()
+        .position(|value| *value == edition)
+        .unwrap_or(99)
+}
+
+fn sort_candidates(candidates: &mut [DiscoveryCandidate]) {
+    candidates.sort_by(|left, right| {
+        right
+            .version
+            .unwrap_or(0)
+            .cmp(&left.version.unwrap_or(0))
+            .then_with(|| edition_rank(&left.edition).cmp(&edition_rank(&right.edition)))
+            .then_with(|| left.selected_path.cmp(&right.selected_path))
+    });
+}
+
+fn deduplicate_candidates(candidates: &mut Vec<DiscoveryCandidate>) {
+    let mut seen = std::collections::HashSet::new();
+    candidates.retain(|candidate| {
+        let key = candidate
+            .library_path
+            .to_string_lossy()
+            .to_ascii_lowercase();
+        seen.insert(key)
+    });
 }
 
 fn is_library_path(path: &Path) -> bool {
@@ -322,7 +488,7 @@ fn is_library_path(path: &Path) -> bool {
 }
 
 #[cfg(target_os = "macos")]
-fn scan_common_paths() -> Vec<PathBuf> {
+fn scan_installations() -> (Vec<DiscoveryCandidate>, Option<String>) {
     let base = Path::new("/Applications");
     let preferred = ["StataMP", "StataSE", "StataIC", "StataBE", "Stata"];
     let mut apps = Vec::new();
@@ -362,8 +528,34 @@ fn scan_common_paths() -> Vec<PathBuf> {
         a_score.cmp(&b_score).then_with(|| a_name.cmp(&b_name))
     });
 
-    apps.iter()
-        .flat_map(|app| resolve_from_user_path(app))
+    let mut candidates = apps
+        .iter()
+        .flat_map(|app| macos_candidates_for_app(app, "applications"))
+        .collect::<Vec<_>>();
+    sort_candidates(&mut candidates);
+    (candidates, None)
+}
+
+#[cfg(target_os = "macos")]
+fn macos_candidates_for_app(app: &Path, source: &str) -> Vec<DiscoveryCandidate> {
+    if !is_stata_app_path(app) {
+        return Vec::new();
+    }
+    let parent_name = app
+        .parent()
+        .and_then(|value| value.file_name())
+        .and_then(|value| value.to_str())
+        .unwrap_or("");
+    let app_name = app_name_without_ext(app);
+    let version = parse_numeric_version(&[parent_name, &app_name]);
+    macos_libraries_in(&app.join("Contents").join("MacOS"))
+        .into_iter()
+        .map(|library| {
+            let mut candidate = candidate_from_library(app.to_path_buf(), library, source);
+            candidate.version = version;
+            candidate.display_name = candidate_display_name(app, version, &candidate.edition);
+            candidate
+        })
         .collect()
 }
 
@@ -393,54 +585,143 @@ fn app_name_without_ext(path: &Path) -> String {
 }
 
 #[cfg(target_os = "windows")]
-fn scan_common_paths() -> Vec<PathBuf> {
-    let mut out = Vec::new();
+fn scan_installations() -> (Vec<DiscoveryCandidate>, Option<String>) {
+    match run_windows_discovery() {
+        Ok(value) => match parse_windows_discovery_report(&value) {
+            Ok(candidates) => (candidates, None),
+            Err(error) => (Vec::new(), Some(error)),
+        },
+        Err(error) => (Vec::new(), Some(error)),
+    }
+}
 
-    let drives = ('A'..='Z')
-        .map(|d| PathBuf::from(format!("{}:\\", d)))
-        .filter(|p| {
-            // is_dir is fast on Windows for non-existent drives;
-            // only call when the path actually exists to avoid
-            // unnecessary stat calls on removable / network drives.
-            p.exists()
-        })
-        .collect::<Vec<_>>();
-
-    for drive in &drives {
-        // drive:\Program Files\Stata*  (catches C:\Program Files\Stata18, etc.)
-        for prog_dir in ["Program Files", "Program Files (x86)"] {
-            let pf = drive.join(prog_dir);
-            if pf.is_dir() {
-                if let Ok(entries) = fs::read_dir(&pf) {
-                    for entry in entries.flatten() {
-                        let name = entry
-                            .file_name()
-                            .to_str()
-                            .unwrap_or("")
-                            .to_ascii_lowercase();
-                        if name.starts_with("stata") {
-                            out.extend(windows_libraries_in(&entry.path()));
-                        }
-                    }
-                }
-            }
-        }
-
-        // drive root: drive:\Stata*  (catches D:\Stata18, etc.)
-        if let Ok(entries) = fs::read_dir(drive) {
-            for entry in entries.flatten() {
-                let name = entry
-                    .file_name()
-                    .to_str()
-                    .unwrap_or("")
-                    .to_ascii_lowercase();
-                if name.starts_with("stata") && entry.path().is_dir() {
-                    out.extend(windows_libraries_in(&entry.path()));
-                }
-            }
+#[cfg(target_os = "windows")]
+fn discovery_script_path() -> Result<PathBuf> {
+    if let Some(value) = env::var_os("STATA_AI_SKILL_DISCOVERY_BAT") {
+        let path = PathBuf::from(value);
+        if path.is_file() {
+            return Ok(path);
         }
     }
-    out
+    let mut candidates = Vec::new();
+    if let Ok(executable) = env::current_exe() {
+        if let Some(skill_root) = executable
+            .parent()
+            .and_then(Path::parent)
+            .and_then(Path::parent)
+        {
+            candidates.push(
+                skill_root
+                    .join("scripts")
+                    .join("discover_stata_windows.bat"),
+            );
+        }
+    }
+    candidates.push(PathBuf::from("scripts").join("discover_stata_windows.bat"));
+    candidates
+        .into_iter()
+        .find(|path| path.is_file())
+        .ok_or_else(|| {
+            "discover_stata_windows.bat was not found; use the aiskill setup fallback".to_string()
+        })
+}
+
+#[cfg(target_os = "windows")]
+fn run_windows_discovery() -> Result<Value> {
+    let script = discovery_script_path()?;
+    let mut child = Command::new("cmd.exe")
+        .args(["/d", "/s", "/c", "call"])
+        .arg(&script)
+        .args(["--stdout-only", "--no-pause"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run {}: {error}", script.display()))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if started.elapsed() < Duration::from_secs(5) => {
+                thread::sleep(Duration::from_millis(50));
+            }
+            Ok(None) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("Windows Stata discovery exceeded 5000 ms".to_string());
+            }
+            Err(error) => return Err(format!("failed to wait for Windows discovery: {error}")),
+        }
+    }
+    let output = child
+        .wait_with_output()
+        .map_err(|error| format!("failed to collect Windows discovery output: {error}"))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Windows Stata discovery failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    serde_json::from_str(stdout.trim_start_matches('\u{feff}').trim())
+        .map_err(|error| format!("invalid Windows discovery JSON: {error}"))
+}
+
+#[cfg(any(target_os = "windows", test))]
+fn parse_windows_discovery_report(report: &Value) -> Result<Vec<DiscoveryCandidate>> {
+    if report.get("schemaVersion").and_then(Value::as_u64) != Some(1) {
+        return Err("unsupported Windows discovery schema".to_string());
+    }
+    let mut candidates = Vec::new();
+    for value in report
+        .get("candidates")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+    {
+        let executable = value
+            .get("executablePath")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let library = value.get("dllPath").and_then(Value::as_str).unwrap_or("");
+        if executable.is_empty() || library.is_empty() {
+            continue;
+        }
+        let edition = value
+            .get("dllEdition")
+            .or_else(|| value.get("edition"))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let version = value
+            .get("version")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32);
+        let license_path = value
+            .get("licensePath")
+            .and_then(Value::as_str)
+            .map(PathBuf::from);
+        candidates.push(DiscoveryCandidate {
+            display_name: candidate_display_name(Path::new(executable), version, &edition),
+            selected_path: PathBuf::from(executable),
+            library_path: PathBuf::from(library),
+            license_found: value
+                .get("hasLicense")
+                .and_then(Value::as_bool)
+                .unwrap_or_else(|| {
+                    license_path
+                        .as_ref()
+                        .map(|path| path.exists())
+                        .unwrap_or(false)
+                }),
+            license_path,
+            edition,
+            version,
+            source: "windows_registry".to_string(),
+        });
+    }
+    sort_candidates(&mut candidates);
+    deduplicate_candidates(&mut candidates);
+    Ok(candidates)
 }
 
 #[cfg(target_os = "windows")]
@@ -462,8 +743,11 @@ fn windows_libraries_in(dir: &Path) -> Vec<PathBuf> {
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "windows")))]
-fn scan_common_paths() -> Vec<PathBuf> {
-    Vec::new()
+fn scan_installations() -> (Vec<DiscoveryCandidate>, Option<String>) {
+    (
+        Vec::new(),
+        Some("automatic Stata discovery is not supported on this platform".to_string()),
+    )
 }
 
 fn example_paths() -> Vec<String> {
@@ -487,49 +771,84 @@ fn example_paths() -> Vec<String> {
     Vec::new()
 }
 
-struct AppState {
+struct RuntimeState {
     config: AppConfig,
-    paths: AppPaths,
     discovery: Discovery,
     session: Option<Arc<StataSession>>,
     init_error: Option<String>,
+}
+
+#[derive(Clone)]
+struct SetupToken {
+    value: String,
+    created_at: Instant,
+}
+
+impl SetupToken {
+    fn valid(&self, value: &str) -> bool {
+        self.value == value && self.created_at.elapsed() <= SETUP_TOKEN_TTL
+    }
+}
+
+struct SetupControl {
+    phase: Option<String>,
+    install_token: Option<SetupToken>,
+    setup_tokens: Vec<SetupToken>,
+    last_result: Option<String>,
+}
+
+struct AppState {
+    paths: AppPaths,
+    runtime: Mutex<RuntimeState>,
+    setup: Mutex<SetupControl>,
     busy: AtomicBool,
     shutting_down: AtomicBool,
 }
 
-fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
-    let port = config.port;
+fn initialize_runtime(config: AppConfig) -> RuntimeState {
     let discovery = discover_stata(config.stata_path.as_deref());
-    let (session, init_error) = if discovery.needs_license {
-        let license_path = discovery
-            .license_path
-            .as_ref()
-            .map(|p| p.to_string_lossy().to_string())
-            .unwrap_or_else(|| "the expected Stata installation directory".to_string());
-        (
-            None,
-            Some(format!(
-                "Stata license file not found at {license_path}. Please make sure Stata is installed and licensed."
-            )),
-        )
-    } else if let Some(lib) = &discovery.library_path {
-        match StataSession::new(lib) {
-            Ok(session) => {
-                let _ = session.execute("quietly _gr_list on", false);
-                (Some(Arc::new(session)), None)
-            }
-            Err(err) => (None, Some(err)),
-        }
-    } else {
-        (None, None)
-    };
-
-    let state = Arc::new(AppState {
+    let (session, init_error) = initialize_session(&discovery);
+    RuntimeState {
         config,
-        paths,
         discovery,
         session,
         init_error,
+    }
+}
+
+fn initialize_session(discovery: &Discovery) -> (Option<Arc<StataSession>>, Option<String>) {
+    if discovery.needs_license {
+        let license_path = discovery
+            .license_path
+            .as_ref()
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_else(|| "the expected Stata installation directory".to_string());
+        return (None, Some(format!("Stata license file not found at {license_path}. Please make sure Stata is installed and licensed.")));
+    }
+    let Some(library) = &discovery.library_path else {
+        return (None, None);
+    };
+    match StataSession::new(library) {
+        Ok(session) => {
+            let session = Arc::new(session);
+            let _ = session.execute("quietly _gr_list on", false);
+            (Some(session), None)
+        }
+        Err(error) => (None, Some(error)),
+    }
+}
+
+fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
+    let port = config.port;
+    let state = Arc::new(AppState {
+        paths,
+        runtime: Mutex::new(initialize_runtime(config)),
+        setup: Mutex::new(SetupControl {
+            phase: None,
+            install_token: None,
+            setup_tokens: Vec::new(),
+            last_result: None,
+        }),
         busy: AtomicBool::new(false),
         shutting_down: AtomicBool::new(false),
     });
@@ -555,8 +874,10 @@ fn serve(config: AppConfig, paths: AppPaths) -> Result<()> {
             Err(err) => return Err(format!("accept failed: {err}")),
         }
     }
-    if let Some(session) = &state.session {
-        session.shutdown();
+    if let Ok(runtime) = state.runtime.lock() {
+        if let Some(session) = &runtime.session {
+            session.shutdown();
+        }
     }
     Ok(())
 }
@@ -571,20 +892,54 @@ fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> 
     let request_line = lines.next().unwrap_or("");
     let mut parts = request_line.split_whitespace();
     let method = parts.next().unwrap_or("");
-    let path = parts.next().unwrap_or("");
+    let uri = parts.next().unwrap_or("");
+    let (path, query) = uri.split_once('?').unwrap_or((uri, ""));
+    let headers = lines
+        .filter_map(|line| line.split_once(':'))
+        .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
+        .collect::<std::collections::HashMap<_, _>>();
 
-    let (status, json) = match (method, path) {
-        ("GET", "/status") => (200, status_json(&state)),
-        ("POST", "/execute") => execute_json(&state, body),
-        ("POST", "/break") => break_json(&state),
-        ("POST", "/shutdown") => shutdown_json(&state),
-        ("OPTIONS", _) => (204, String::new()),
+    let (status, response, content_type) = match (method, path) {
+        ("GET", "/status") if query_value(query, "format").as_deref() == Some("stata") => {
+            (200, status_stata_text(&state), "text/plain; charset=utf-8")
+        }
+        ("GET", "/status") => (200, status_json(&state), "application/json"),
+        ("POST", "/execute") => { let (status, body) = execute_json(&state, body); (status, body, "application/json") },
+        ("POST", "/configure") => { let (status, body) = configure_json(&state, body); (status, body, "application/json") },
+        ("POST", "/setup/install-session") => {
+            if let Err(error) = validate_setup_headers(&headers, &state) {
+                (403, json_error(&error), "application/json")
+            } else {
+                let (status, body) = install_session_json(&state);
+                (status, body, "application/json")
+            }
+        },
+        ("GET", "/installed") => {
+            if let Err(error) = validate_setup_headers(&headers, &state) {
+                (403, stata_error_text(&error), "text/plain; charset=utf-8")
+            } else {
+                let (status, text) = installed_text(&state, query);
+                (status, text, "text/plain; charset=utf-8")
+            }
+        }
+        ("GET", "/setup") => {
+            if let Err(error) = validate_setup_headers(&headers, &state) {
+                (403, stata_error_text(&error), "text/plain; charset=utf-8")
+            } else {
+                let (status, text) = setup_text(Arc::clone(&state), query);
+                (status, text, "text/plain; charset=utf-8")
+            }
+        }
+        ("POST", "/break") => { let (status, body) = break_json(&state); (status, body, "application/json") },
+        ("POST", "/shutdown") => { let (status, body) = shutdown_json(&state); (status, body, "application/json") },
+        ("OPTIONS", _) => (204, String::new(), "application/json"),
         _ => (
             404,
-            r#"{"success":false,"error":"Not Found. Available endpoints: GET /status, POST /execute, POST /break, POST /shutdown"}"#.to_string(),
+            r#"{"success":false,"error":"Not Found. Available endpoints: GET /status, POST /configure, POST /setup/install-session, GET /installed, GET /setup, POST /execute, POST /break, POST /shutdown"}"#.to_string(),
+            "application/json",
         ),
     };
-    write_response(&mut stream, status, &json)
+    write_response_with_type(&mut stream, status, &response, content_type)
 }
 
 fn read_http_request(stream: &mut TcpStream) -> Result<String> {
@@ -647,18 +1002,29 @@ fn content_length_from_head(head: &[u8]) -> Result<usize> {
 }
 
 fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()> {
+    write_response_with_type(stream, status, body, "application/json")
+}
+
+fn write_response_with_type(
+    stream: &mut TcpStream,
+    status: u16,
+    body: &str,
+    content_type: &str,
+) -> Result<()> {
     let reason = match status {
         200 => "OK",
         204 => "No Content",
         400 => "Bad Request",
         408 => "Request Timeout",
         409 => "Conflict",
+        422 => "Unprocessable Entity",
+        426 => "Upgrade Required",
         500 => "Internal Server Error",
         503 => "Service Unavailable",
         _ => "OK",
     };
     let response = format!(
-        "HTTP/1.1 {status} {reason}\r\nContent-Type: application/json\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        "HTTP/1.1 {status} {reason}\r\nContent-Type: {content_type}\r\nCache-Control: no-store\r\nPragma: no-cache\r\nX-Content-Type-Options: nosniff\r\nAccess-Control-Allow-Methods: GET, POST, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
         body.len()
     );
     stream
@@ -667,13 +1033,17 @@ fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> Result<()>
 }
 
 fn status_json(state: &AppState) -> String {
-    let session_active = state
+    let runtime = match state.runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => return json_error("runtime state is unavailable"),
+    };
+    let session_active = runtime
         .session
         .as_ref()
         .map(|s| s.is_active())
         .unwrap_or(false);
-    let needs_configuration = state.discovery.needs_configuration;
-    let needs_license = state.discovery.needs_license;
+    let needs_configuration = runtime.discovery.needs_configuration;
+    let needs_license = runtime.discovery.needs_license;
     let message = if session_active {
         if state.busy.load(Ordering::SeqCst) {
             "Stata is busy executing".to_string()
@@ -681,12 +1051,59 @@ fn status_json(state: &AppState) -> String {
             "Stata session is active".to_string()
         }
     } else if needs_license {
-        state.discovery.message.clone()
-    } else if let Some(err) = &state.init_error {
-        format!("Stata initialization failed: {err}. Ask the user where the Stata app/program is installed, then reconfigure with `stata-ai-skill config set --stata-path <path>`.")
+        runtime.discovery.message.clone()
+    } else if let Some(err) = &runtime.init_error {
+        format!("Stata initialization failed: {err}. Use /configure with a confirmed candidate or guide the user through aiskill setup.")
     } else {
-        state.discovery.message.clone()
+        runtime.discovery.message.clone()
     };
+    let mut setup = state.setup.lock().ok();
+    if let Some(setup) = setup.as_mut() {
+        setup
+            .setup_tokens
+            .retain(|token| token.created_at.elapsed() <= SETUP_TOKEN_TTL);
+        if setup
+            .install_token
+            .as_ref()
+            .map(|token| token.created_at.elapsed() > SETUP_TOKEN_TTL)
+            .unwrap_or(false)
+        {
+            setup.install_token = None;
+            setup.phase = Some("manual_setup_required".to_string());
+            setup.last_result = Some("Installation session expired".to_string());
+        }
+    }
+    let phase = setup
+        .as_ref()
+        .and_then(|value| value.phase.clone())
+        .unwrap_or_else(|| {
+            if session_active {
+                "ready".to_string()
+            } else if runtime.init_error.is_some() || needs_license {
+                "configuration_failed".to_string()
+            } else if !runtime.discovery.candidates.is_empty() {
+                "selection_required".to_string()
+            } else {
+                "manual_setup_required".to_string()
+            }
+        });
+    let next_action = match phase.as_str() {
+        "selection_required" => "ask_user_to_select_candidate",
+        "manual_setup_required" => "ask_permission_to_install_aiskill",
+        "awaiting_install_result" => "wait_for_installation_result",
+        "awaiting_aiskill_setup" => "ask_user_to_run_aiskill_setup",
+        "configuring" => "wait_for_configuration",
+        "install_failed" => "offer_retry_or_skip",
+        "configuration_failed" => "report_error_or_retry_setup",
+        _ => "execute_stata",
+    };
+    let candidate_values = runtime
+        .discovery
+        .candidates
+        .iter()
+        .enumerate()
+        .map(|(index, candidate)| candidate.value(index == 0))
+        .collect::<Vec<_>>();
     json!({
         "service": SERVICE_NAME,
         "skillVersion": SKILL_VERSION,
@@ -695,24 +1112,34 @@ fn status_json(state: &AppState) -> String {
         "busy": state.busy.load(Ordering::SeqCst),
         "needsConfiguration": needs_configuration,
         "needsLicense": needs_license,
-        "licenseFound": state.discovery.license_found,
-        "licensePath": state.discovery.license_path.as_ref().map(|p| p.to_string_lossy().to_string()),
-        "missing": if needs_configuration {
+        "licenseFound": runtime.discovery.license_found,
+        "licensePath": runtime.discovery.license_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+        "missing": if needs_configuration && !runtime.discovery.candidates.is_empty() {
+            Some("stata_selection")
+        } else if needs_configuration {
             Some("stata_library_path")
         } else if needs_license {
             Some("stata_license")
-        } else if state.init_error.is_some() {
+        } else if runtime.init_error.is_some() {
             Some("stata_initialization")
         } else {
             None
         },
         "message": message,
-        "examplePaths": &state.discovery.examples,
-        "detectedCandidates": paths_to_strings(&state.discovery.candidates),
-        "initError": &state.init_error,
+        "examplePaths": &runtime.discovery.examples,
+        "detectedCandidates": candidate_values,
+        "recommendedCandidate": runtime.discovery.candidates.first().map(|candidate| candidate.value(true)),
+        "discoveryError": &runtime.discovery.error,
+        "initError": &runtime.init_error,
+        "setup": {
+            "phase": phase,
+            "lastResult": setup.as_ref().and_then(|value| value.last_result.clone()),
+            "nextAction": next_action,
+            "sessionExpiresSeconds": SETUP_TOKEN_TTL.as_secs()
+        },
         "config": {
-            "port": state.config.port,
-            "stataPath": state.config.stata_path.as_ref().map(|p| p.to_string_lossy().to_string()),
+            "port": runtime.config.port,
+            "stataPath": runtime.config.stata_path.as_ref().map(|p| p.to_string_lossy().to_string()),
             "configFile": state.paths.config_file.to_string_lossy().to_string(),
             "logDir": state.paths.log_dir.to_string_lossy().to_string(),
             "tempDir": state.paths.temp_dir.to_string_lossy().to_string(),
@@ -724,25 +1151,567 @@ fn status_json(state: &AppState) -> String {
             "cwd": true,
             "timeoutMaxSeconds": MAX_TIMEOUT_SEC,
             "graphs": "svg,png,jpg"
+            ,"configure": true,
+            "aiskillSetup": true
         }
     })
     .to_string()
+}
+
+fn random_token() -> Result<String> {
+    let mut bytes = [0_u8; 24];
+    getrandom::fill(&mut bytes)
+        .map_err(|error| format!("failed to generate setup token: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
+}
+
+fn clean_stata_field(value: impl ToString) -> String {
+    value.to_string().replace(['\r', '\n'], " ")
+}
+
+fn stata_text(fields: &[(&str, String)]) -> String {
+    let mut output = format!("AISKILL/{SETUP_PROTOCOL_VERSION}\n");
+    for (key, value) in fields {
+        output.push_str(key);
+        output.push('=');
+        output.push_str(&clean_stata_field(value));
+        output.push('\n');
+    }
+    output
+}
+
+fn stata_error_text(message: &str) -> String {
+    stata_text(&[
+        ("success", "0".to_string()),
+        ("message", message.to_string()),
+    ])
+}
+
+fn base_setup_phase(runtime: &RuntimeState) -> &'static str {
+    let active = runtime
+        .session
+        .as_ref()
+        .map(|session| session.is_active())
+        .unwrap_or(false);
+    if active {
+        "ready"
+    } else if runtime.init_error.is_some() || runtime.discovery.needs_license {
+        "configuration_failed"
+    } else if !runtime.discovery.candidates.is_empty() {
+        "selection_required"
+    } else {
+        "manual_setup_required"
+    }
+}
+
+fn status_stata_text(state: &AppState) -> String {
+    let token = random_token().unwrap_or_else(|_| unique_id());
+    if let Ok(mut setup) = state.setup.lock() {
+        setup
+            .setup_tokens
+            .retain(|item| item.created_at.elapsed() <= SETUP_TOKEN_TTL);
+        setup.setup_tokens.push(SetupToken {
+            value: token.clone(),
+            created_at: Instant::now(),
+        });
+        if setup.setup_tokens.len() > 8 {
+            let remove_count = setup.setup_tokens.len() - 8;
+            setup.setup_tokens.drain(..remove_count);
+        }
+    }
+    let runtime = match state.runtime.lock() {
+        Ok(runtime) => runtime,
+        Err(_) => return stata_error_text("Runtime state is unavailable."),
+    };
+    let setup = state.setup.lock().ok();
+    let phase = setup
+        .as_ref()
+        .and_then(|value| value.phase.as_deref())
+        .unwrap_or_else(|| base_setup_phase(&runtime));
+    let installation_path = runtime
+        .config
+        .stata_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    let edition = runtime
+        .discovery
+        .library_path
+        .as_ref()
+        .map(|path| edition_from_library(path))
+        .unwrap_or_default();
+    let session_active = runtime
+        .session
+        .as_ref()
+        .map(|session| session.is_active())
+        .unwrap_or(false);
+    stata_text(&[
+        ("service", SERVICE_NAME.to_string()),
+        ("protocolVersion", SETUP_PROTOCOL_VERSION.to_string()),
+        ("skillVersion", SKILL_VERSION.to_string()),
+        ("setupToken", token),
+        (
+            "configured",
+            if runtime.config.stata_path.is_some() {
+                "1"
+            } else {
+                "0"
+            }
+            .to_string(),
+        ),
+        ("installationPath", installation_path),
+        ("stataEdition", edition.to_ascii_uppercase()),
+        (
+            "sessionActive",
+            if session_active { "1" } else { "0" }.to_string(),
+        ),
+        ("setupPhase", phase.to_string()),
+    ])
+}
+
+fn configure_json(state: &AppState, body: &str) -> (u16, String) {
+    if state.busy.load(Ordering::SeqCst) {
+        return (
+            409,
+            json_error("Stata is busy; configuration cannot change during execution"),
+        );
+    }
+    let value: Value = match serde_json::from_str(body) {
+        Ok(value) => value,
+        Err(error) => return (400, json_error(&format!("invalid JSON: {error}"))),
+    };
+    let path = match value
+        .get("stataPath")
+        .and_then(Value::as_str)
+        .map(str::trim)
+    {
+        Some(path) if !path.is_empty() => PathBuf::from(path),
+        _ => return (400, json_error("`stataPath` must be a non-empty string")),
+    };
+    match configure_path(state, path) {
+        Ok(()) => (200, status_json(state)),
+        Err(error) => {
+            if let Ok(mut setup) = state.setup.lock() {
+                setup.phase = Some("configuration_failed".to_string());
+                setup.last_result = Some(error.clone());
+            }
+            (422, json!({ "success": false, "error": error, "status": serde_json::from_str::<Value>(&status_json(state)).unwrap_or(Value::Null) }).to_string())
+        }
+    }
+}
+
+fn configure_path(state: &AppState, path: PathBuf) -> Result<()> {
+    let (port, has_active_session, current_path) = {
+        let runtime = state
+            .runtime
+            .lock()
+            .map_err(|_| "runtime state is unavailable".to_string())?;
+        (
+            runtime.config.port,
+            runtime
+                .session
+                .as_ref()
+                .map(|session| session.is_active())
+                .unwrap_or(false),
+            runtime.config.stata_path.clone(),
+        )
+    };
+    if has_active_session {
+        if current_path.as_deref() == Some(path.as_path()) {
+            if let Ok(mut setup) = state.setup.lock() {
+                setup.phase = Some("ready".to_string());
+                setup.last_result = Some(format!(
+                    "Stata is already configured from {}",
+                    path.display()
+                ));
+            }
+            return Ok(());
+        }
+        return Err("A Stata session is already active. Shut down the service before selecting another installation.".to_string());
+    }
+    let config = AppConfig {
+        port,
+        stata_path: Some(path.clone()),
+    };
+    let next = initialize_runtime(config.clone());
+    if next.discovery.library_path.is_none() {
+        return Err(format!(
+            "No compatible Stata library was found from {}",
+            path.display()
+        ));
+    }
+    if next.discovery.needs_license {
+        return Err(next.discovery.message.clone());
+    }
+    if let Some(error) = &next.init_error {
+        return Err(format!("Stata initialization failed: {error}"));
+    }
+    if next.session.as_ref().map(|session| session.is_active()) != Some(true) {
+        return Err("Stata session did not become active".to_string());
+    }
+    config.save(&state.paths)?;
+    let mut runtime = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?;
+    *runtime = next;
+    drop(runtime);
+    if let Ok(mut setup) = state.setup.lock() {
+        setup.phase = Some("ready".to_string());
+        setup.last_result = Some(format!("Configured Stata from {}", path.display()));
+    }
+    Ok(())
+}
+
+fn skill_root_from_executable() -> Option<PathBuf> {
+    env::current_exe()
+        .ok()?
+        .parent()?
+        .parent()?
+        .parent()
+        .map(Path::to_path_buf)
+}
+
+fn aiskill_package_dir() -> Result<PathBuf> {
+    let candidates = [
+        skill_root_from_executable().map(|root| root.join("stata").join("aiskill")),
+        Some(PathBuf::from("stata").join("aiskill")),
+        Some(
+            PathBuf::from("skills")
+                .join("stata-ai-skill")
+                .join("stata")
+                .join("aiskill"),
+        ),
+    ];
+    candidates
+        .into_iter()
+        .flatten()
+        .find(|path| path.join("aiskill.pkg").is_file())
+        .ok_or_else(|| "The bundled aiskill Stata package was not found.".to_string())
+}
+
+fn install_session_json(state: &AppState) -> (u16, String) {
+    let token = match random_token() {
+        Ok(token) => token,
+        Err(error) => return (500, json_error(&error)),
+    };
+    let package = match aiskill_package_dir() {
+        Ok(path) => path,
+        Err(error) => return (500, json_error(&error)),
+    };
+    let port = match state.runtime.lock() {
+        Ok(runtime) => runtime.config.port,
+        Err(_) => return (500, json_error("runtime state is unavailable")),
+    };
+    let installation_path = env::temp_dir().join("installation.do");
+    let package_path = package
+        .to_string_lossy()
+        .replace('\\', "/")
+        .replace('"', "\"\"");
+    let script = format!(
+        "tempfile __aiskill_install_response\ncapture noisily net install aiskill, from(\"{package_path}\") replace\nlocal __aiskill_install_rc = _rc\nif `__aiskill_install_rc' == 0 {{\n    capture quietly copy \"http://127.0.0.1:{port}/installed?aiskill=1&token={token}\" \"`__aiskill_install_response'\", replace\n}}\nelse {{\n    capture quietly copy \"http://127.0.0.1:{port}/installed?aiskill=0&token={token}\" \"`__aiskill_install_response'\", replace\n}}\n"
+    );
+    if let Err(error) = fs::write(&installation_path, script) {
+        return (
+            500,
+            json_error(&format!("failed to create installation.do: {error}")),
+        );
+    }
+    if let Ok(mut setup) = state.setup.lock() {
+        setup.phase = Some("awaiting_install_result".to_string());
+        setup.install_token = Some(SetupToken {
+            value: token,
+            created_at: Instant::now(),
+        });
+        setup.last_result = None;
+    }
+    (
+        200,
+        json!({
+            "success": true,
+            "phase": "awaiting_install_result",
+            "command": "do \"`c(tmpdir)'/installation.do\"",
+            "installationDo": installation_path.to_string_lossy(),
+            "expiresSeconds": SETUP_TOKEN_TTL.as_secs()
+        })
+        .to_string(),
+    )
+}
+
+fn installed_text(state: &AppState, query: &str) -> (u16, String) {
+    let result = query_value(query, "aiskill");
+    let token = query_value(query, "token").unwrap_or_default();
+    if !matches!(result.as_deref(), Some("0") | Some("1")) {
+        return (
+            400,
+            stata_error_text("The aiskill installation result must be 0 or 1."),
+        );
+    }
+    let mut setup = match state.setup.lock() {
+        Ok(setup) => setup,
+        Err(_) => return (500, stata_error_text("Setup state is unavailable.")),
+    };
+    if !setup
+        .install_token
+        .as_ref()
+        .map(|item| item.valid(&token))
+        .unwrap_or(false)
+    {
+        return (
+            403,
+            stata_error_text("The installation token is invalid or expired."),
+        );
+    }
+    setup.install_token = None;
+    let installed = result.as_deref() == Some("1");
+    setup.phase = Some(
+        if installed {
+            "awaiting_aiskill_setup"
+        } else {
+            "install_failed"
+        }
+        .to_string(),
+    );
+    setup.last_result = Some(
+        if installed {
+            "aiskill installed successfully"
+        } else {
+            "aiskill installation failed"
+        }
+        .to_string(),
+    );
+    (
+        200,
+        stata_text(&[
+            ("success", "1".to_string()),
+            ("installed", if installed { "1" } else { "0" }.to_string()),
+            (
+                "message",
+                if installed {
+                    "Installation acknowledged. Run aiskill setup."
+                } else {
+                    "Installation failure acknowledged."
+                }
+                .to_string(),
+            ),
+        ]),
+    )
+}
+
+fn normalize_signal_platform(os: &str, machine_type: &str) -> String {
+    let os = os.to_ascii_lowercase();
+    let machine = machine_type.to_ascii_lowercase();
+    if os.contains("windows") {
+        "windows".to_string()
+    } else if os.contains("mac") || (os == "unix" && machine.contains("mac")) {
+        "macos".to_string()
+    } else {
+        os
+    }
+}
+
+fn host_platform() -> &'static str {
+    if cfg!(target_os = "windows") {
+        "windows"
+    } else if cfg!(target_os = "macos") {
+        "macos"
+    } else {
+        "unsupported"
+    }
+}
+
+fn resolve_signal_path(sysdir_values: &[String], flavor: &str) -> Option<PathBuf> {
+    let requested = flavor.to_ascii_lowercase();
+    let mut candidates = sysdir_values
+        .iter()
+        .flat_map(|value| resolve_from_user_path(Path::new(value)))
+        .collect::<Vec<_>>();
+    sort_candidates(&mut candidates);
+    candidates
+        .iter()
+        .find(|candidate| candidate.edition == requested)
+        .or_else(|| candidates.first())
+        .map(|candidate| candidate.selected_path.clone())
+}
+
+fn setup_text(state: Arc<AppState>, query: &str) -> (u16, String) {
+    if state.busy.load(Ordering::SeqCst) {
+        return (409, stata_error_text("Run aiskill setup from a separately opened GUI Stata, not from the Stata AI Skill session."));
+    }
+    let required = [
+        "protocolVersion",
+        "setupToken",
+        "clientVersion",
+        "os",
+        "stataVersion",
+        "flavor",
+        "machineType",
+        "sysdirStata",
+    ];
+    let mut fields = std::collections::HashMap::new();
+    for key in required {
+        let Some(value) = query_value(query, key) else {
+            return (
+                400,
+                stata_error_text(&format!("Missing setup field: {key}.")),
+            );
+        };
+        fields.insert(key, value);
+    }
+    if fields.get("protocolVersion").map(String::as_str) != Some("1") {
+        return (
+            426,
+            stata_error_text("The aiskill protocol version is incompatible."),
+        );
+    }
+    if normalize_signal_platform(&fields["os"], &fields["machineType"]) != host_platform() {
+        return (
+            409,
+            stata_error_text(
+                "The running Stata platform does not match the Stata AI Skill service.",
+            ),
+        );
+    }
+    {
+        let mut setup = match state.setup.lock() {
+            Ok(setup) => setup,
+            Err(_) => return (500, stata_error_text("Setup state is unavailable.")),
+        };
+        let token = &fields["setupToken"];
+        let Some(index) = setup.setup_tokens.iter().position(|item| item.valid(token)) else {
+            return (
+                403,
+                stata_error_text("The setup token is invalid or expired."),
+            );
+        };
+        setup.setup_tokens.remove(index);
+        setup.phase = Some("configuring".to_string());
+        setup.last_result = Some("Configuration signal received from Stata".to_string());
+    }
+    let sysdir_values = query_value_candidates(query, "sysdirStata");
+    let Some(path) = resolve_signal_path(&sysdir_values, &fields["flavor"]) else {
+        if let Ok(mut setup) = state.setup.lock() {
+            setup.phase = Some("configuration_failed".to_string());
+            setup.last_result =
+                Some("Could not resolve the Stata installation from c(sysdir_stata).".to_string());
+        }
+        return (
+            422,
+            stata_error_text("Could not resolve the Stata installation from c(sysdir_stata)."),
+        );
+    };
+    thread::spawn(move || {
+        if let Err(error) = configure_path(&state, path) {
+            if let Ok(mut setup) = state.setup.lock() {
+                setup.phase = Some("configuration_failed".to_string());
+                setup.last_result = Some(error);
+            }
+        }
+    });
+    (
+        200,
+        stata_text(&[
+            ("success", "1".to_string()),
+            ("accepted", "1".to_string()),
+            (
+                "message",
+                "Configuration received. Wait for the agent to confirm the result.".to_string(),
+            ),
+        ]),
+    )
+}
+
+fn validate_setup_headers(
+    headers: &std::collections::HashMap<String, String>,
+    state: &AppState,
+) -> Result<()> {
+    if headers.contains_key("origin") {
+        return Err("Browser-originated setup requests are not allowed.".to_string());
+    }
+    let port = state
+        .runtime
+        .lock()
+        .map_err(|_| "runtime state is unavailable".to_string())?
+        .config
+        .port;
+    let host = headers
+        .get("host")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_default();
+    if host != format!("127.0.0.1:{port}") && host != format!("localhost:{port}") {
+        return Err("Invalid setup service host.".to_string());
+    }
+    Ok(())
+}
+
+fn percent_decode_bytes(value: &str) -> Vec<u8> {
+    let bytes = value.as_bytes();
+    let mut output = Vec::new();
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let Ok(byte) = u8::from_str_radix(&value[index + 1..index + 3], 16) {
+                output.push(byte);
+                index += 3;
+                continue;
+            }
+        }
+        if bytes[index] == b'+' {
+            output.push(b' ');
+        } else {
+            output.push(bytes[index]);
+        }
+        index += 1;
+    }
+    output
+}
+
+fn query_value_candidates(query: &str, key: &str) -> Vec<String> {
+    let Some(raw) = query.split('&').find_map(|part| {
+        let (name, value) = part.split_once('=')?;
+        if name == key {
+            Some(value)
+        } else {
+            None
+        }
+    }) else {
+        return Vec::new();
+    };
+    let bytes = percent_decode_bytes(raw);
+    let mut values = Vec::new();
+    if let Ok(value) = String::from_utf8(bytes.clone()) {
+        values.push(value);
+    }
+    for encoding in [GBK, BIG5, SHIFT_JIS, EUC_KR, WINDOWS_1252] {
+        let (value, _, had_errors) = encoding.decode(&bytes);
+        if !had_errors && !values.iter().any(|item| item == value.as_ref()) {
+            values.push(value.into_owned());
+        }
+    }
+    values
+}
+
+fn query_value(query: &str, key: &str) -> Option<String> {
+    query_value_candidates(query, key).into_iter().next()
 }
 
 fn execute_json(state: &AppState, body: &str) -> (u16, String) {
     if state.shutting_down.load(Ordering::SeqCst) {
         return (503, json_error("Service is shutting down"));
     }
-    let session = match &state.session {
-        Some(session) if session.is_active() => Arc::clone(session),
-        _ => {
-            return (
-                503,
-                json_error(
-                    "Stata session is not initialized. Check /status for needsConfiguration.",
-                ),
-            )
-        }
+    let session = match state.runtime.lock() {
+        Ok(runtime) => match &runtime.session {
+            Some(session) if session.is_active() => Arc::clone(session),
+            _ => {
+                return (
+                    503,
+                    json_error(
+                        "Stata session is not initialized. Check /status for setup.nextAction.",
+                    ),
+                )
+            }
+        },
+        Err(_) => return (503, json_error("runtime state is unavailable")),
     };
     if state
         .busy
@@ -771,6 +1740,19 @@ fn execute_inner(
 ) -> (u16, String) {
     if request.code.trim().is_empty() && request.file.trim().is_empty() {
         return (400, json_error("Provide `code` or `file` in JSON body."));
+    }
+    let guard_text = if !request.file.trim().is_empty() {
+        fs::read_to_string(&request.file).unwrap_or_default()
+    } else {
+        request.code.clone()
+    };
+    if contains_aiskill_self_call(&guard_text) {
+        return (
+            400,
+            json_error(
+                "Run `aiskill setup` or `aiskill status` from a separately opened GUI Stata, not through /execute.",
+            ),
+        );
     }
     let prepared = match prepare_command_with_cwd(state, &request.code, &request.file, &request.cwd)
     {
@@ -852,11 +1834,40 @@ fn execute_inner(
     )
 }
 
+fn contains_aiskill_self_call(code: &str) -> bool {
+    code.lines().any(|line| {
+        let mut line = line.trim_start();
+        if line.starts_with('*') || line.starts_with("//") {
+            return false;
+        }
+        while let Some(rest) = [
+            "quietly", "quietly:", "capture", "capture:", "noisily", "noisily:",
+        ]
+        .iter()
+        .find_map(|prefix| {
+            line.strip_prefix(prefix).and_then(|rest| {
+                if rest.starts_with(char::is_whitespace) {
+                    Some(rest.trim_start())
+                } else {
+                    None
+                }
+            })
+        }) {
+            line = rest;
+        }
+        let lower = line.to_ascii_lowercase();
+        lower == "aiskill"
+            || lower.starts_with("aiskill setup")
+            || lower.starts_with("aiskill status")
+    })
+}
+
 fn break_json(state: &AppState) -> (u16, String) {
     let stopped = state
-        .session
-        .as_ref()
-        .map(|s| s.set_break())
+        .runtime
+        .lock()
+        .ok()
+        .and_then(|runtime| runtime.session.as_ref().map(|session| session.set_break()))
         .unwrap_or(false);
     (
         200,
@@ -874,9 +1885,11 @@ fn break_json(state: &AppState) -> (u16, String) {
 
 fn shutdown_json(state: &AppState) -> (u16, String) {
     state.shutting_down.store(true, Ordering::SeqCst);
-    if let Some(session) = &state.session {
-        if state.busy.load(Ordering::SeqCst) {
-            session.set_break();
+    if let Ok(runtime) = state.runtime.lock() {
+        if let Some(session) = &runtime.session {
+            if state.busy.load(Ordering::SeqCst) {
+                session.set_break();
+            }
         }
     }
     (
@@ -1986,13 +2999,6 @@ fn unique_id() -> String {
     format!("{}_{}_{}", millis, std::process::id(), counter)
 }
 
-fn paths_to_strings(paths: &[PathBuf]) -> Vec<String> {
-    paths
-        .iter()
-        .map(|path| path.to_string_lossy().to_string())
-        .collect()
-}
-
 fn graph_values(graphs: &[GraphExport]) -> Vec<Value> {
     graphs
         .iter()
@@ -2046,11 +3052,22 @@ mod tests {
 
     fn test_state() -> AppState {
         let root = env::temp_dir().join(format!("stata-ai-skill-test-{}", unique_id()));
+        let config = AppConfig {
+            port: 19522,
+            stata_path: None,
+        };
+        let discovery = Discovery {
+            library_path: None,
+            license_path: None,
+            license_found: false,
+            needs_configuration: true,
+            needs_license: false,
+            message: "test".to_string(),
+            examples: Vec::new(),
+            candidates: Vec::new(),
+            error: None,
+        };
         AppState {
-            config: AppConfig {
-                port: 19522,
-                stata_path: None,
-            },
             paths: AppPaths {
                 config_file: root.join("config.toml"),
                 log_dir: root.join("logs"),
@@ -2058,18 +3075,18 @@ mod tests {
                 graph_dir: root.join("graphs"),
                 config_dir: root,
             },
-            discovery: Discovery {
-                library_path: None,
-                license_path: None,
-                license_found: false,
-                needs_configuration: true,
-                needs_license: false,
-                message: "test".to_string(),
-                examples: Vec::new(),
-                candidates: Vec::new(),
-            },
-            session: None,
-            init_error: None,
+            runtime: Mutex::new(RuntimeState {
+                config,
+                discovery,
+                session: None,
+                init_error: None,
+            }),
+            setup: Mutex::new(SetupControl {
+                phase: None,
+                install_token: None,
+                setup_tokens: Vec::new(),
+                last_result: None,
+            }),
             busy: AtomicBool::new(false),
             shutting_down: AtomicBool::new(false),
         }
@@ -2285,5 +3302,127 @@ mod tests {
         let names = parse_graph_names("Graph g1 g1 _tmp invalid-name 2bad");
 
         assert_eq!(names, vec!["Graph", "g1", "_tmp"]);
+    }
+
+    #[test]
+    fn sorts_discovery_candidates_by_version_then_edition() {
+        let candidate = |version, edition: &str, name: &str| DiscoveryCandidate {
+            display_name: name.to_string(),
+            selected_path: PathBuf::from(name),
+            library_path: PathBuf::from(format!("{name}.dll")),
+            license_path: None,
+            license_found: true,
+            edition: edition.to_string(),
+            version: Some(version),
+            source: "test".to_string(),
+        };
+        let mut candidates = vec![
+            candidate(18, "mp", "Stata18MP"),
+            candidate(19, "se", "Stata19SE"),
+            candidate(19, "mp", "Stata19MP"),
+        ];
+        sort_candidates(&mut candidates);
+        assert_eq!(candidates[0].display_name, "Stata19MP");
+        assert_eq!(candidates[1].display_name, "Stata19SE");
+        assert_eq!(candidates[2].display_name, "Stata18MP");
+    }
+
+    #[test]
+    fn parses_windows_bat_schema_and_candidates() {
+        let report = json!({
+            "schemaVersion": 1,
+            "candidates": [{
+                "executablePath": "C:\\Program Files\\Stata19\\StataMP-64.exe",
+                "dllPath": "C:\\Program Files\\Stata19\\mp-64.dll",
+                "licensePath": "C:\\Program Files\\Stata19\\stata.lic",
+                "hasLicense": true,
+                "edition": "mp",
+                "version": 19
+            }]
+        });
+        let candidates = parse_windows_discovery_report(&report).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].edition, "mp");
+        assert_eq!(candidates[0].version, Some(19));
+        assert!(candidates[0].license_found);
+        assert_eq!(
+            parse_windows_discovery_report(&json!({ "schemaVersion": 2 })).unwrap_err(),
+            "unsupported Windows discovery schema"
+        );
+    }
+
+    #[test]
+    fn json_status_does_not_rotate_stata_setup_tokens() {
+        let state = test_state();
+        let first = status_stata_text(&state);
+        assert!(first.starts_with("AISKILL/1\n"));
+        let before = state.setup.lock().unwrap().setup_tokens[0].value.clone();
+        let json: Value = serde_json::from_str(&status_json(&state)).unwrap();
+        assert_eq!(json["setup"]["phase"], "manual_setup_required");
+        let after = state.setup.lock().unwrap().setup_tokens[0].value.clone();
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn install_session_waits_for_valid_single_use_callback() {
+        let state = test_state();
+        let (status, body) = install_session_json(&state);
+        assert_eq!(status, 200);
+        let response: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(response["phase"], "awaiting_install_result");
+        assert_eq!(response["command"], "do \"`c(tmpdir)'/installation.do\"");
+        let token = state
+            .setup
+            .lock()
+            .unwrap()
+            .install_token
+            .as_ref()
+            .unwrap()
+            .value
+            .clone();
+        let (callback_status, callback) =
+            installed_text(&state, &format!("aiskill=1&token={token}"));
+        assert_eq!(callback_status, 200);
+        assert!(callback.starts_with("AISKILL/1\n"));
+        assert_eq!(
+            state.setup.lock().unwrap().phase.as_deref(),
+            Some("awaiting_aiskill_setup")
+        );
+        assert_eq!(
+            installed_text(&state, &format!("aiskill=1&token={token}")).0,
+            403
+        );
+        let _ = fs::remove_file(env::temp_dir().join("installation.do"));
+    }
+
+    #[test]
+    fn decodes_utf8_and_gbk_setup_paths() {
+        assert_eq!(
+            query_value("sysdirStata=C%3A%5CStata+19", "sysdirStata").as_deref(),
+            Some("C:\\Stata 19")
+        );
+        let values = query_value_candidates("sysdirStata=%D6%D0%CE%C4", "sysdirStata");
+        assert!(values.iter().any(|value| value == "\u{4e2d}\u{6587}"));
+    }
+
+    #[test]
+    fn bundled_aiskill_command_has_no_saio_or_auxiliary_port_scan() {
+        let ado = fs::read_to_string("stata/aiskill/aiskill.ado").unwrap();
+        assert!(!ado.to_ascii_lowercase().contains("saio"));
+        assert!(!ado.contains("16886"));
+        assert!(!ado.contains("16895"));
+        assert!(!ado
+            .to_ascii_lowercase()
+            .contains("syntax [anything(name=command)] [, port"));
+        assert!(ado.contains("127.0.0.1:19522"));
+    }
+
+    #[test]
+    fn blocks_aiskill_self_setup_and_status_calls() {
+        assert!(contains_aiskill_self_call("aiskill setup"));
+        assert!(contains_aiskill_self_call("quietly: aiskill status"));
+        assert!(contains_aiskill_self_call("capture noisily aiskill"));
+        assert!(!contains_aiskill_self_call("aiskill version"));
+        assert!(!contains_aiskill_self_call("* aiskill setup"));
     }
 }
