@@ -9,3 +9,5 @@ Please download the `stata-ai-skill-v1.1.zip` file from the [China download link
 ```bash/cmd
 npx skills add ZihaoVistonWang/Stata-AI-Skill --skill stata-ai-skill
 ```
+
+Please read the `SKILL.md` file after installation via `skills.sh`.
