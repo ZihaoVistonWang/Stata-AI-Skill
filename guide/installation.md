@@ -1,6 +1,6 @@
 # Installation
 
-We recommend installing **Stata AI Skill** with **skills.sh**. If this method encounters any issue that cannot be resolved promptly, stop troubleshooting and immediately switch to the ZIP installation method below.
+We recommend installing Stata AI Skill with skills.sh, regardless of whether the user has previously installed this Skill. If this method encounters any issue that cannot be resolved promptly, stop troubleshooting and immediately switch to the ZIP installation method below.
 
 ## Install With skills.sh
 
