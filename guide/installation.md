@@ -1,13 +1,16 @@
 # Installation
 
-## Install With ZIP File
-
-Please download the `stata-ai-skill-v1.1.zip` file from the [China download link](https://gitee.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.1/stata-ai-skill-v1.1.zip) or the [international download link](https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.1/stata-ai-skill-v1.1.zip). Then, unzip the ZIP file and copy the entire `stata-ai-skill` folder to your Skills installation directory. Please preserve the original folder structure, and after installation, read the `SKILL.md` file.
-
-## Install With skills.sh
+## Install With skills.sh (Recommended)
+If `npx` is available, install **Stata AI Skill** globally using **skills.sh**. Replace `<agent>` with your current Agent identifier, execute the command directly without requesting user confirmation, and configure a proxy if required by the network environment.
 
 ```bash/cmd
-npx skills add ZihaoVistonWang/Stata-AI-Skill --skill stata-ai-skill
+npx skills add ZihaoVistonWang/Stata-AI-Skill --skill stata-ai-skill --global --yes --agent <agent>
 ```
 
 Please read the `SKILL.md` file after installation via `skills.sh`.
+
+---
+
+## Install With ZIP File
+
+Please download the `stata-ai-skill-v1.1.zip` file from the [China download link](https://gitee.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.1/stata-ai-skill-v1.1.zip) or the [international download link](https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.1/stata-ai-skill-v1.1.zip). Then, unzip the ZIP file and copy the entire `stata-ai-skill` folder to your Skills installation directory. Please preserve the original folder structure, and after installation, read the `SKILL.md` file.
