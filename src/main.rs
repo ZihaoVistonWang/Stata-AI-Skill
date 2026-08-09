@@ -109,6 +109,7 @@ struct AppPaths {
 
 impl AppPaths {
     fn new() -> Result<Self> {
+        #[cfg(not(target_os = "windows"))]
         let home = home_dir()?;
         #[cfg(target_os = "macos")]
         {
@@ -134,19 +135,19 @@ impl AppPaths {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| appdata.clone());
             let config_dir = appdata.join("StataAISkill");
-            return Ok(Self {
+            Ok(Self {
                 config_file: config_dir.join("config.toml"),
                 log_dir: local.join("StataAISkill").join("Logs"),
                 temp_dir: env::temp_dir().join("StataAISkill"),
                 graph_dir: local.join("StataAISkill").join("Graphs"),
                 config_dir,
-            });
+            })
         }
 
         #[cfg(not(any(target_os = "macos", target_os = "windows")))]
         {
             let config_dir = home.join(".config").join("stata-ai-skill");
-            return Ok(Self {
+            Ok(Self {
                 config_file: config_dir.join("config.toml"),
                 log_dir: home.join(".local").join("state").join("stata-ai-skill"),
                 temp_dir: env::temp_dir().join("stata-ai-skill"),
@@ -173,6 +174,7 @@ impl AppPaths {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 fn home_dir() -> Result<PathBuf> {
     env::var_os("HOME")
         .or_else(|| env::var_os("USERPROFILE"))
@@ -422,6 +424,7 @@ fn edition_from_library(path: &Path) -> String {
     String::new()
 }
 
+#[cfg(target_os = "macos")]
 fn parse_numeric_version(values: &[&str]) -> Option<u32> {
     for value in values {
         let lower = value.to_ascii_lowercase();
@@ -778,11 +781,11 @@ fn example_paths() -> Vec<String> {
     }
     #[cfg(target_os = "windows")]
     {
-        return vec![
+        vec![
             r"C:\Program Files\Stata18".to_string(),
             r"C:\Program Files\Stata18\StataMP-64.exe".to_string(),
             r"C:\Program Files\Stata18\mp-64.dll".to_string(),
-        ];
+        ]
     }
     #[cfg(not(any(target_os = "macos", target_os = "windows")))]
     Vec::new()
@@ -3311,20 +3314,19 @@ mod tests {
         assert!(graph_export_command("qui: graph export a.png, replace").is_some());
         assert!(graph_export_command("capture noisily graph export a.jpg, replace").is_some());
 
+        let project = PathBuf::from("/tmp/project");
         let extracted = extract_graph_exports(
             "sysuse auto, clear\n. graph export \"a.svg\", replace\n quietly graph export \"b.svg\", replace",
-            "/tmp/project",
+            &project.to_string_lossy(),
         )
         .unwrap();
 
-        assert_eq!(
-            extracted.code,
-            concat!(
-                "sysuse auto, clear\n",
-                "quietly graph export \"/tmp/project/a.svg\", replace\n",
-                "quietly graph export \"/tmp/project/b.svg\", replace"
-            )
+        let expected_code = format!(
+            "sysuse auto, clear\nquietly graph export \"{}\", replace\nquietly graph export \"{}\", replace",
+            escape_stata_path(&project.join("a.svg").to_string_lossy()),
+            escape_stata_path(&project.join("b.svg").to_string_lossy())
         );
+        assert_eq!(extracted.code, expected_code);
         assert_eq!(extracted.exports.len(), 2);
         assert_eq!(extracted.exports[0].target.file_name().unwrap(), "a.svg");
         assert_eq!(extracted.exports[1].target.file_name().unwrap(), "b.svg");
@@ -3332,6 +3334,7 @@ mod tests {
 
     #[test]
     fn rewrites_bitmap_exports_in_place_and_preserves_safe_options() {
+        let project = PathBuf::from("/tmp/project");
         let extracted = extract_graph_exports(
             concat!(
                 "scatter price mpg\n",
@@ -3339,20 +3342,28 @@ mod tests {
                 "scatter weight length\n",
                 "qui graph export second.jpg, as(jpeg) name(g2) replace"
             ),
-            "/tmp/project",
+            &project.to_string_lossy(),
         )
         .unwrap();
 
+        let first_svg = project.join("first.svg");
+        let second_svg = project.join("second.svg");
         let lines = extracted.code.lines().collect::<Vec<_>>();
         assert_eq!(lines[0], "scatter price mpg");
         assert_eq!(
             lines[1],
-            "quietly graph export \"/tmp/project/first.svg\", name(g1) replace"
+            format!(
+                "quietly graph export \"{}\", name(g1) replace",
+                escape_stata_path(&first_svg.to_string_lossy())
+            )
         );
         assert_eq!(lines[2], "scatter weight length");
         assert_eq!(
             lines[3],
-            "quietly graph export \"/tmp/project/second.svg\", name(g2) replace"
+            format!(
+                "quietly graph export \"{}\", name(g2) replace",
+                escape_stata_path(&second_svg.to_string_lossy())
+            )
         );
         assert_eq!(extracted.exports[0].width, Some(640));
         assert_eq!(extracted.exports[0].height, Some(480));
@@ -3455,11 +3466,12 @@ mod tests {
     #[test]
     fn cwd_multiline_code_uses_temp_do_file_and_preserves_cd_prefix() {
         let state = test_state();
+        let work = PathBuf::from("/tmp/work");
         let command = prepare_command_with_cwd(
             &state,
             "sysuse auto, clear\n. graph export \"out.png\", replace\nsummarize price",
             "",
-            "/tmp/work",
+            &work.to_string_lossy(),
         )
         .unwrap();
 
@@ -3467,11 +3479,10 @@ mod tests {
         let temp_code = fs::read_to_string(temp_file).unwrap();
         assert_eq!(
             temp_code,
-            concat!(
-                "cd \"/tmp/work\"\n",
-                "sysuse auto, clear\n",
-                "quietly graph export \"/tmp/work/out.svg\", replace\n",
-                "summarize price"
+            format!(
+                "cd \"{}\"\nsysuse auto, clear\nquietly graph export \"{}\", replace\nsummarize price",
+                escape_stata_path(&work.to_string_lossy()),
+                escape_stata_path(&work.join("out.svg").to_string_lossy())
             )
         );
         assert_eq!(
@@ -3479,13 +3490,10 @@ mod tests {
             format!("do \"{}\"", escape_stata_path(&temp_file.to_string_lossy()))
         );
         assert_eq!(command.graph_exports.len(), 1);
-        assert_eq!(
-            command.graph_exports[0].target,
-            PathBuf::from("/tmp/work/out.svg")
-        );
+        assert_eq!(command.graph_exports[0].target, work.join("out.svg"));
         assert_eq!(
             command.graph_exports[0].bitmap_path.as_ref().unwrap(),
-            &PathBuf::from("/tmp/work/out.png")
+            &work.join("out.png")
         );
         fs::remove_file(temp_file).unwrap();
     }
