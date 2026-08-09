@@ -4,7 +4,7 @@ Always reinstall **Stata AI Skill**, regardless of whether the user has previous
 
 First, detect the Agent tools installed or configured on the local system. Install **Stata AI Skill** for as many detected Agents as possible, rather than only for the Agent currently performing the installation. If installation fails for one Agent, skip only that Agent and continue installing for the others.
 
-We recommend using **skills.sh**. If this method encounters any issue that cannot be resolved promptly, stop troubleshooting and immediately switch to the ZIP installation method below.
+We recommend using **skills.sh**. You can first check whether the network can connect to google or github. If this method encounters any issue that cannot be resolved promptly (such as VPN network environment, etc.), stop troubleshooting and immediately switch to the ZIP installation method below.
 
 ## Install With skills.sh
 
