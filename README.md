@@ -82,7 +82,7 @@ After installation, locate and read the installed `SKILL.md` file before using t
 
 ### Install With ZIP File
 
-Download `stata-ai-skill-v1.1.zip` from either the [China download link](https://gitee.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.1/stata-ai-skill-v1.1.zip) or the [international download link](https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.1/stata-ai-skill-v1.1.zip).
+Download `stata-ai-skill-v1.2.zip` from either the [China download link](https://gitee.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.2/stata-ai-skill-v1.2.zip) or the [international download link](https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.2/stata-ai-skill-v1.2.zip).
 
 Extract the ZIP file and detect the Skills installation directory used by each Agent installed or configured on the local system. Copy the entire `stata-ai-skill` folder into as many applicable Agent Skills directories as possible, replacing any existing version while preserving the original folder structure.
 

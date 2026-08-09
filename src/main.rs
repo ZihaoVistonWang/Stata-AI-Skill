@@ -17,13 +17,14 @@ use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_1252};
 use serde_json::{json, Value};
 
 const SERVICE_NAME: &str = "stata-ai-skill";
-const SKILL_VERSION: &str = "v1.1";
+const SKILL_VERSION: &str = "v1.2";
 const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
 const MAX_REQUEST_BYTES: usize = 8 * 1024 * 1024;
 const SETUP_TOKEN_TTL: Duration = Duration::from_secs(600);
 const SETUP_PROTOCOL_VERSION: u8 = 1;
+const GRAPH_FILE_EXISTS_PREFIX: &str = "graph_file_exists:";
 static UNIQUE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 type Result<T> = std::result::Result<T, String>;
@@ -115,13 +116,13 @@ impl AppPaths {
                 .join("Library")
                 .join("Application Support")
                 .join("stata-ai-skill");
-            return Ok(Self {
+            Ok(Self {
                 config_file: config_dir.join("config.toml"),
                 log_dir: home.join("Library").join("Logs").join("stata-ai-skill"),
                 temp_dir: env::temp_dir().join("stata-ai-skill"),
                 graph_dir: config_dir.join("graphs"),
                 config_dir,
-            });
+            })
         }
 
         #[cfg(target_os = "windows")]
@@ -769,11 +770,11 @@ fn scan_installations() -> (Vec<DiscoveryCandidate>, Option<String>) {
 fn example_paths() -> Vec<String> {
     #[cfg(target_os = "macos")]
     {
-        return vec![
+        vec![
             "/Applications/StataMP.app".to_string(),
             "/Applications/StataNow/StataMP.app".to_string(),
             "/Applications/StataMP.app/Contents/MacOS/libstata-mp.dylib".to_string(),
-        ];
+        ]
     }
     #[cfg(target_os = "windows")]
     {
@@ -1743,7 +1744,7 @@ fn query_value(query: &str, key: &str) -> Option<String> {
     query_value_candidates(query, key).into_iter().next()
 }
 
-fn execute_json(state: &AppState, body: &str) -> (u16, String) {
+fn execute_json(state: &Arc<AppState>, body: &str) -> (u16, String) {
     if state.shutting_down.load(Ordering::SeqCst) {
         return (503, json_error("Service is shutting down"));
     }
@@ -1776,18 +1777,23 @@ fn execute_json(state: &AppState, body: &str) -> (u16, String) {
             return (400, json_error(&err));
         }
     };
-    let result = execute_inner(state, session, request);
-    state.busy.store(false, Ordering::SeqCst);
+    let (result, execution_finished) = execute_inner(state, session, request);
+    if execution_finished {
+        state.busy.store(false, Ordering::SeqCst);
+    }
     result
 }
 
 fn execute_inner(
-    state: &AppState,
+    state: &Arc<AppState>,
     session: Arc<StataSession>,
     request: ExecuteRequest,
-) -> (u16, String) {
+) -> ((u16, String), bool) {
     if request.code.trim().is_empty() && request.file.trim().is_empty() {
-        return (400, json_error("Provide `code` or `file` in JSON body."));
+        return (
+            (400, json_error("Provide `code` or `file` in JSON body.")),
+            true,
+        );
     }
     let guard_text = if !request.file.trim().is_empty() {
         fs::read_to_string(&request.file).unwrap_or_default()
@@ -1795,17 +1801,35 @@ fn execute_inner(
         request.code.clone()
     };
     if contains_aiskill_self_call(&guard_text) {
-        return (
+        return ((
             400,
             json_error(
                 "Run `aiskill setup` or `aiskill status` from a separately opened GUI Stata, not through /execute.",
             ),
-        );
+        ), true);
     }
     let prepared = match prepare_command_with_cwd(state, &request.code, &request.file, &request.cwd)
     {
         Ok(prepared) => prepared,
-        Err(err) => return (400, json_error(&err)),
+        Err(err) => {
+            if let Some(path) = err.strip_prefix(GRAPH_FILE_EXISTS_PREFIX) {
+                return (
+                    (
+                        500,
+                        json!({
+                            "success": false,
+                            "returnCode": 602,
+                            "output": "",
+                            "error": format!("file {path} already exists"),
+                            "graphs": []
+                        })
+                        .to_string(),
+                    ),
+                    true,
+                );
+            }
+            return ((400, json_error(&err)), true);
+        }
     };
     let timeout = request
         .timeout
@@ -1813,12 +1837,23 @@ fn execute_inner(
         .min(MAX_TIMEOUT_SEC);
     let (tx, rx) = mpsc::channel();
     let run_session = Arc::clone(&session);
+    let run_state = Arc::clone(state);
+    let abandoned = Arc::new(AtomicBool::new(false));
+    let run_abandoned = Arc::clone(&abandoned);
+    let delayed_temp_file = prepared.temp_file.clone();
     let command = prepared.command.clone();
     thread::spawn(move || {
-        let _ = tx.send(run_session.execute(&command, request.echo));
+        let result = run_session.execute(&command, request.echo);
+        let _ = tx.send(result);
+        if run_abandoned.load(Ordering::SeqCst) {
+            if let Some(path) = delayed_temp_file {
+                let _ = fs::remove_file(path);
+            }
+            run_state.busy.store(false, Ordering::SeqCst);
+        }
     });
-    let mut result = match rx.recv_timeout(Duration::from_secs(timeout)) {
-        Ok(result) => result,
+    let (mut result, execution_finished) = match rx.recv_timeout(Duration::from_secs(timeout)) {
+        Ok(result) => (result, true),
         Err(_) => {
             session.set_break();
             match rx.recv_timeout(Duration::from_secs(10)) {
@@ -1826,19 +1861,29 @@ fn execute_inner(
                     result.success = false;
                     result.return_code = -1;
                     result.error = format!("Execution timed out after {timeout}s");
-                    result
+                    (result, true)
                 }
-                Err(_) => ExecuteResult {
-                    success: false,
-                    return_code: -1,
-                    output: format!("Execution timed out after {timeout}s"),
-                    error: format!("Execution timed out after {timeout}s"),
-                },
+                Err(_) => {
+                    abandoned.store(true, Ordering::SeqCst);
+                    (
+                        ExecuteResult {
+                            success: false,
+                            return_code: -1,
+                            output: format!("Execution timed out after {timeout}s"),
+                            error: format!(
+                                "Execution timed out after {timeout}s; Stata is still stopping"
+                            ),
+                        },
+                        false,
+                    )
+                }
             }
         }
     };
-    if let Some(path) = prepared.temp_file {
-        let _ = fs::remove_file(path);
+    if execution_finished {
+        if let Some(path) = prepared.temp_file {
+            let _ = fs::remove_file(path);
+        }
     }
     let (graphs, graph_notes) = if result.success {
         if prepared.graph_exports.is_empty() {
@@ -1868,17 +1913,20 @@ fn execute_inner(
         result.error = "Stata execution failed".to_string();
     }
     (
-        status,
-        format!(
-            "{}",
-            json!({
-                "success": result.success,
-                "returnCode": result.return_code,
-                "output": result.output,
-                "error": result.error,
-                "graphs": graph_values(&graphs)
-            })
+        (
+            status,
+            format!(
+                "{}",
+                json!({
+                    "success": result.success,
+                    "returnCode": result.return_code,
+                    "output": result.output,
+                    "error": result.error,
+                    "graphs": graph_values(&graphs)
+                })
+            ),
         ),
+        execution_finished,
     )
 }
 
@@ -1983,6 +2031,9 @@ struct GraphExportRequest {
     bitmap_format: Option<BitmapFormat>,
     name: Option<String>,
     replace: bool,
+    width: Option<u32>,
+    height: Option<u32>,
+    options: String,
     requested_format: String,
     rewritten_to_svg: bool,
 }
@@ -2044,6 +2095,16 @@ fn prepare_command_with_cwd(
         });
     }
     let extracted = extract_graph_exports(code, cwd)?;
+    for request in &extracted.exports {
+        if let Some(bitmap_path) = &request.bitmap_path {
+            if bitmap_path.exists() && !request.replace {
+                return Err(format!(
+                    "{GRAPH_FILE_EXISTS_PREFIX}{}",
+                    bitmap_path.to_string_lossy()
+                ));
+            }
+        }
+    }
     let normalized = normalize_code(&extracted.code);
     if normalized.is_empty() {
         if prefix.is_empty() {
@@ -2117,17 +2178,19 @@ struct ExtractedGraphExports {
 }
 
 fn extract_graph_exports(code: &str, cwd: &str) -> Result<ExtractedGraphExports> {
-    let mut kept = Vec::new();
+    let mut rewritten = Vec::new();
     let mut exports = Vec::new();
     for line in code.replace("\r\n", "\n").replace('\r', "\n").lines() {
         if let Some(command) = graph_export_command(line) {
-            exports.push(parse_graph_export(command, line.trim(), cwd)?);
+            let request = parse_graph_export(command, line.trim(), cwd)?;
+            rewritten.push(render_graph_export_command(&request));
+            exports.push(request);
         } else {
-            kept.push(line.to_string());
+            rewritten.push(line.to_string());
         }
     }
     Ok(ExtractedGraphExports {
-        code: kept.join("\n"),
+        code: rewritten.join("\n"),
         exports,
     })
 }
@@ -2137,15 +2200,30 @@ fn graph_export_command(line: &str) -> Option<&str> {
     if let Some(after_dot) = rest.strip_prefix('.') {
         rest = after_dot.trim_start();
     }
-    if starts_with_ascii_ci(rest, "quietly") {
-        let after = &rest["quietly".len()..];
-        if after
-            .chars()
-            .next()
-            .map(char::is_whitespace)
-            .unwrap_or(false)
-        {
-            rest = after.trim_start();
+    loop {
+        let mut stripped = None;
+        for prefix in ["quietly", "qui", "capture", "cap", "noisily", "noi"] {
+            if !starts_with_ascii_ci(rest, prefix) {
+                continue;
+            }
+            let mut after = &rest[prefix.len()..];
+            if let Some(without_colon) = after.strip_prefix(':') {
+                after = without_colon;
+            }
+            if after
+                .chars()
+                .next()
+                .map(char::is_whitespace)
+                .unwrap_or(false)
+            {
+                stripped = Some(after.trim_start());
+                break;
+            }
+        }
+        if let Some(after) = stripped {
+            rest = after;
+        } else {
+            break;
         }
     }
     if !starts_with_ascii_ci(rest, "graph") {
@@ -2182,9 +2260,11 @@ fn parse_graph_export(command: &str, original_line: &str, cwd: &str) -> Result<G
         .ok_or_else(|| format!("failed to parse graph export path: {original_line}"))?;
     let name = parse_name_option(options);
     let replace = has_option_word(options, "replace");
+    let width = parse_positive_integer_option(options, "width");
+    let height = parse_positive_integer_option(options, "height");
     let option_format = parse_as_option(options);
     let requested_format = graph_format(&path_text, option_format.as_deref());
-    let rewritten_to_svg = requested_format.to_ascii_lowercase() != "svg";
+    let rewritten_to_svg = !requested_format.eq_ignore_ascii_case("svg");
     let bitmap_format = BitmapFormat::from_graph_format(&requested_format);
     let bitmap_path = bitmap_format.map(|format| bitmap_output_path(&path_text, format, cwd));
     let target_text = if let Some(bitmap_path) = &bitmap_path {
@@ -2202,9 +2282,65 @@ fn parse_graph_export(command: &str, original_line: &str, cwd: &str) -> Result<G
         bitmap_format,
         name,
         replace,
+        width,
+        height,
+        options: options.to_string(),
         requested_format,
         rewritten_to_svg,
     })
+}
+
+fn render_graph_export_command(request: &GraphExportRequest) -> String {
+    let mut options = split_stata_options(&request.options);
+    if request.rewritten_to_svg {
+        options.retain(|option| option.to_ascii_lowercase().starts_with("name("));
+        options.push("replace".to_string());
+    }
+    let suffix = if options.is_empty() {
+        String::new()
+    } else {
+        format!(", {}", options.join(" "))
+    };
+    format!(
+        "quietly graph export \"{}\"{}",
+        escape_stata_path(&request.target.to_string_lossy()),
+        suffix
+    )
+}
+
+fn split_stata_options(options: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut depth = 0_u32;
+    for ch in options.chars() {
+        match ch {
+            '(' => {
+                depth += 1;
+                current.push(ch);
+            }
+            ')' => {
+                depth = depth.saturating_sub(1);
+                current.push(ch);
+            }
+            ',' if depth == 0 => {
+                if !current.trim().is_empty() {
+                    out.push(current.trim().to_string());
+                    current.clear();
+                }
+            }
+            ch if ch.is_whitespace() && depth == 0 => {
+                if !current.trim().is_empty() {
+                    out.push(current.trim().to_string());
+                    current.clear();
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if !current.trim().is_empty() {
+        out.push(current.trim().to_string());
+    }
+    out
 }
 
 fn parse_graph_export_path(command: &str) -> Option<(String, &str)> {
@@ -2254,6 +2390,13 @@ fn parse_name_option(options: &str) -> Option<String> {
 
 fn parse_as_option(options: &str) -> Option<String> {
     parse_parenthesized_option(options, "as").map(|value| value.to_ascii_lowercase())
+}
+
+fn parse_positive_integer_option(options: &str, option: &str) -> Option<u32> {
+    parse_parenthesized_option(options, option)?
+        .parse()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 fn parse_parenthesized_option(options: &str, option: &str) -> Option<String> {
@@ -2321,11 +2464,10 @@ fn bitmap_output_path(path: &str, format: BitmapFormat, cwd: &str) -> PathBuf {
         .extension()
         .and_then(|value| value.to_str())
         .map(|value| value.to_ascii_lowercase());
-    let ext_matches = match (format, ext.as_deref()) {
-        (BitmapFormat::Png, Some("png")) => true,
-        (BitmapFormat::Jpg, Some("jpg" | "jpeg")) => true,
-        _ => false,
-    };
+    let ext_matches = matches!(
+        (format, ext.as_deref()),
+        (BitmapFormat::Png, Some("png")) | (BitmapFormat::Jpg, Some("jpg" | "jpeg"))
+    );
     if !ext_matches {
         out.set_extension(format.extension());
     }
@@ -2386,42 +2528,23 @@ fn export_requested_graphs(
     session: &Arc<StataSession>,
     requests: &[GraphExportRequest],
 ) -> (Vec<GraphExport>, Vec<String>) {
-    let names = current_graph_names(session);
     let mut out = Vec::new();
     let mut notes = Vec::new();
     for request in requests {
-        if let Some(parent) = request.target.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        let graph_name = request.name.clone().or_else(|| names.first().cloned());
-        let mut options = Vec::new();
-        if let Some(name) = &graph_name {
-            options.push(format!("name({name})"));
-        }
-        if request.replace {
-            options.push("replace".to_string());
-        }
-        let cmd = if options.is_empty() {
-            format!(
-                "quietly graph export \"{}\"",
-                escape_stata_path(&request.target.to_string_lossy())
-            )
-        } else {
-            format!(
-                "quietly graph export \"{}\", {}",
-                escape_stata_path(&request.target.to_string_lossy()),
-                options.join(" ")
-            )
-        };
-        let result = session.execute(&cmd, false);
-        if result.success && request.target.exists() {
+        if request.target.exists() {
             let mut png = None;
             let mut file = None;
             let mut format = None;
             if let (Some(bitmap_path), Some(bitmap_format)) =
                 (&request.bitmap_path, request.bitmap_format)
             {
-                match convert_svg_to_bitmap(&request.target, bitmap_path, bitmap_format) {
+                match convert_svg_to_bitmap(
+                    &request.target,
+                    bitmap_path,
+                    bitmap_format,
+                    request.width,
+                    request.height,
+                ) {
                     Ok(()) => {
                         notes.push(format!(
                             "graph export requested {label}; exported SVG and converted bitmap: {path}",
@@ -2450,7 +2573,7 @@ fn export_requested_graphs(
                 ));
             }
             out.push(GraphExport {
-                name: graph_name.unwrap_or_else(|| "Graph".to_string()),
+                name: request.name.clone().unwrap_or_else(|| "Graph".to_string()),
                 svg: request.target.clone(),
                 png,
                 file,
@@ -2462,13 +2585,13 @@ fn export_requested_graphs(
     (out, notes)
 }
 
-fn current_graph_names(session: &Arc<StataSession>) -> Vec<String> {
-    let _ = session.execute("quietly _gr_list list", false);
-    let result = session.execute("display \"`r(_grlist)'\"", false);
-    parse_graph_names(&result.output)
-}
-
-fn convert_svg_to_bitmap(svg: &Path, dest: &Path, format: BitmapFormat) -> Result<()> {
+fn convert_svg_to_bitmap(
+    svg: &Path,
+    dest: &Path,
+    format: BitmapFormat,
+    requested_width: Option<u32>,
+    requested_height: Option<u32>,
+) -> Result<()> {
     if let Some(parent) = dest.parent() {
         fs::create_dir_all(parent)
             .map_err(|err| format!("failed to create bitmap output directory: {err}"))?;
@@ -2483,10 +2606,26 @@ fn convert_svg_to_bitmap(svg: &Path, dest: &Path, format: BitmapFormat) -> Resul
     let svg_data = fs::read(svg).map_err(|err| format!("failed to read SVG: {err}"))?;
     let tree = resvg::usvg::Tree::from_data(&svg_data, &options)
         .map_err(|err| format!("failed to parse SVG: {err}"))?;
-    let size = tree.size().to_int_size();
-    let mut pixmap = tiny_skia::Pixmap::new(size.width(), size.height())
+    let source_size = tree.size();
+    let source_width = source_size.width();
+    let source_height = source_size.height();
+    let width = requested_width.unwrap_or_else(|| {
+        requested_height
+            .map(|height| ((height as f32 * source_width / source_height).round() as u32).max(1))
+            .unwrap_or_else(|| source_size.to_int_size().width())
+    });
+    let height = requested_height.unwrap_or_else(|| {
+        requested_width
+            .map(|width| ((width as f32 * source_height / source_width).round() as u32).max(1))
+            .unwrap_or_else(|| source_size.to_int_size().height())
+    });
+    let mut pixmap = tiny_skia::Pixmap::new(width, height)
         .ok_or_else(|| "failed to create bitmap buffer".to_string())?;
-    resvg::render(&tree, tiny_skia::Transform::default(), &mut pixmap.as_mut());
+    let transform = tiny_skia::Transform::from_scale(
+        width as f32 / source_width,
+        height as f32 / source_height,
+    );
+    resvg::render(&tree, transform, &mut pixmap.as_mut());
     let width = pixmap.width();
     let height = pixmap.height();
     let rgba = pixmap.take_demultiplied();
@@ -2703,65 +2842,22 @@ impl Drop for NativeApi {
     }
 }
 
-#[cfg(not(target_os = "windows"))]
-struct PlatformSession {
-    api: Mutex<NativeApi>,
-    break_fn: StataSetBreak,
-}
-
-#[cfg(not(target_os = "windows"))]
-impl PlatformSession {
-    fn new(library_path: &Path) -> Result<Self> {
-        let api = unsafe { NativeApi::load(library_path)? };
-        api.init(library_path)?;
-        let break_fn = api.set_break;
-        Ok(Self {
-            api: Mutex::new(api),
-            break_fn,
-        })
-    }
-
-    fn execute(&self, code: &str, echo: bool) -> ExecuteResult {
-        match self.api.lock() {
-            Ok(api) => api.execute(code, echo),
-            Err(_) => ExecuteResult {
-                success: false,
-                return_code: -1,
-                output: String::new(),
-                error: "Stata session mutex poisoned".to_string(),
-            },
-        }
-    }
-
-    fn set_break(&self) -> bool {
-        unsafe { (self.break_fn)() };
-        true
-    }
-
-    fn shutdown(&self) {
-        if let Ok(api) = self.api.lock() {
-            api.shutdown();
-        }
-    }
-}
-
-#[cfg(target_os = "windows")]
 struct PlatformSession {
     tx: mpsc::Sender<WorkerCommand>,
     break_fn: Arc<Mutex<Option<StataSetBreak>>>,
 }
 
-#[cfg(target_os = "windows")]
 enum WorkerCommand {
     Execute {
         code: String,
         echo: bool,
         reply: mpsc::Sender<ExecuteResult>,
     },
-    Shutdown,
+    Shutdown {
+        reply: mpsc::Sender<()>,
+    },
 }
 
-#[cfg(target_os = "windows")]
 impl PlatformSession {
     fn new(library_path: &Path) -> Result<Self> {
         let library_path = library_path.to_path_buf();
@@ -2769,36 +2865,40 @@ impl PlatformSession {
         let (init_tx, init_rx) = mpsc::channel();
         let break_fn = Arc::new(Mutex::new(None));
         let worker_break_fn = Arc::clone(&break_fn);
-        thread::spawn(move || {
-            let init = unsafe { NativeApi::load(&library_path) }.and_then(|api| {
-                api.init(&library_path)?;
-                if let Ok(mut slot) = worker_break_fn.lock() {
-                    *slot = Some(api.set_break);
-                }
-                Ok(api)
-            });
-            let api = match init {
-                Ok(api) => {
-                    let _ = init_tx.send(Ok(()));
-                    api
-                }
-                Err(err) => {
-                    let _ = init_tx.send(Err(err));
-                    return;
-                }
-            };
-            while let Ok(command) = rx.recv() {
-                match command {
-                    WorkerCommand::Execute { code, echo, reply } => {
-                        let _ = reply.send(api.execute(&code, echo));
+        thread::Builder::new()
+            .name("stata-native-worker".to_string())
+            .spawn(move || {
+                let init = unsafe { NativeApi::load(&library_path) }.and_then(|api| {
+                    api.init(&library_path)?;
+                    if let Ok(mut slot) = worker_break_fn.lock() {
+                        *slot = Some(api.set_break);
                     }
-                    WorkerCommand::Shutdown => {
-                        api.shutdown();
-                        break;
+                    Ok(api)
+                });
+                let api = match init {
+                    Ok(api) => {
+                        let _ = init_tx.send(Ok(()));
+                        api
+                    }
+                    Err(err) => {
+                        let _ = init_tx.send(Err(err));
+                        return;
+                    }
+                };
+                while let Ok(command) = rx.recv() {
+                    match command {
+                        WorkerCommand::Execute { code, echo, reply } => {
+                            let _ = reply.send(api.execute(&code, echo));
+                        }
+                        WorkerCommand::Shutdown { reply } => {
+                            api.shutdown();
+                            let _ = reply.send(());
+                            break;
+                        }
                     }
                 }
-            }
-        });
+            })
+            .map_err(|err| format!("failed to start Stata worker: {err}"))?;
         match init_rx.recv() {
             Ok(Ok(())) => Ok(Self { tx, break_fn }),
             Ok(Err(err)) => Err(err),
@@ -2842,7 +2942,10 @@ impl PlatformSession {
     }
 
     fn shutdown(&self) {
-        let _ = self.tx.send(WorkerCommand::Shutdown);
+        let (reply, rx) = mpsc::channel();
+        if self.tx.send(WorkerCommand::Shutdown { reply }).is_ok() {
+            let _ = rx.recv_timeout(Duration::from_secs(2));
+        }
     }
 }
 
@@ -3205,17 +3308,76 @@ mod tests {
     fn recognizes_dot_and_quietly_graph_export_lines() {
         assert!(graph_export_command(". graph export \"a.svg\", replace").is_some());
         assert!(graph_export_command("   quietly graph export \"a.svg\", replace").is_some());
+        assert!(graph_export_command("qui: graph export a.png, replace").is_some());
+        assert!(graph_export_command("capture noisily graph export a.jpg, replace").is_some());
 
         let extracted = extract_graph_exports(
             "sysuse auto, clear\n. graph export \"a.svg\", replace\n quietly graph export \"b.svg\", replace",
-            "",
+            "/tmp/project",
         )
         .unwrap();
 
-        assert_eq!(extracted.code, "sysuse auto, clear");
+        assert_eq!(
+            extracted.code,
+            concat!(
+                "sysuse auto, clear\n",
+                "quietly graph export \"/tmp/project/a.svg\", replace\n",
+                "quietly graph export \"/tmp/project/b.svg\", replace"
+            )
+        );
         assert_eq!(extracted.exports.len(), 2);
         assert_eq!(extracted.exports[0].target.file_name().unwrap(), "a.svg");
         assert_eq!(extracted.exports[1].target.file_name().unwrap(), "b.svg");
+    }
+
+    #[test]
+    fn rewrites_bitmap_exports_in_place_and_preserves_safe_options() {
+        let extracted = extract_graph_exports(
+            concat!(
+                "scatter price mpg\n",
+                "capture graph export \"first.png\", name(g1) width(640) height(480) replace\n",
+                "scatter weight length\n",
+                "qui graph export second.jpg, as(jpeg) name(g2) replace"
+            ),
+            "/tmp/project",
+        )
+        .unwrap();
+
+        let lines = extracted.code.lines().collect::<Vec<_>>();
+        assert_eq!(lines[0], "scatter price mpg");
+        assert_eq!(
+            lines[1],
+            "quietly graph export \"/tmp/project/first.svg\", name(g1) replace"
+        );
+        assert_eq!(lines[2], "scatter weight length");
+        assert_eq!(
+            lines[3],
+            "quietly graph export \"/tmp/project/second.svg\", name(g2) replace"
+        );
+        assert_eq!(extracted.exports[0].width, Some(640));
+        assert_eq!(extracted.exports[0].height, Some(480));
+        assert_eq!(extracted.exports[1].bitmap_format, Some(BitmapFormat::Jpg));
+    }
+
+    #[test]
+    fn preserves_stata_file_exists_behavior_for_bitmap_exports() {
+        let state = test_state();
+        let target = state.paths.temp_dir.join("existing.png");
+        fs::create_dir_all(target.parent().unwrap()).unwrap();
+        fs::write(&target, b"existing").unwrap();
+        let error = prepare_command_with_cwd(
+            &state,
+            "graph export existing.png",
+            "",
+            &state.paths.temp_dir.to_string_lossy(),
+        )
+        .err()
+        .unwrap();
+        assert_eq!(
+            error,
+            format!("{GRAPH_FILE_EXISTS_PREFIX}{}", target.to_string_lossy())
+        );
+        fs::remove_file(target).unwrap();
     }
 
     #[test]
@@ -3233,6 +3395,8 @@ mod tests {
         );
         assert_eq!(request.name.as_deref(), Some("my_graph"));
         assert!(request.replace);
+        assert_eq!(request.width, None);
+        assert_eq!(request.height, None);
         assert_eq!(request.requested_format, "svg");
         assert!(!request.rewritten_to_svg);
     }
@@ -3303,7 +3467,12 @@ mod tests {
         let temp_code = fs::read_to_string(temp_file).unwrap();
         assert_eq!(
             temp_code,
-            "cd \"/tmp/work\"\nsysuse auto, clear\nsummarize price"
+            concat!(
+                "cd \"/tmp/work\"\n",
+                "sysuse auto, clear\n",
+                "quietly graph export \"/tmp/work/out.svg\", replace\n",
+                "summarize price"
+            )
         );
         assert_eq!(
             command.command,
@@ -3334,13 +3503,15 @@ mod tests {
         )
         .unwrap();
 
-        convert_svg_to_bitmap(&svg, &png, BitmapFormat::Png).unwrap();
-        convert_svg_to_bitmap(&svg, &jpg, BitmapFormat::Jpg).unwrap();
+        convert_svg_to_bitmap(&svg, &png, BitmapFormat::Png, Some(48), None).unwrap();
+        convert_svg_to_bitmap(&svg, &jpg, BitmapFormat::Jpg, None, Some(32)).unwrap();
 
         let png_bytes = fs::read(&png).unwrap();
         let jpg_bytes = fs::read(&jpg).unwrap();
         assert!(png_bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(jpg_bytes.starts_with(&[0xff, 0xd8, 0xff]));
+        assert_eq!(image::image_dimensions(&png).unwrap(), (48, 32));
+        assert_eq!(image::image_dimensions(&jpg).unwrap(), (48, 32));
 
         let _ = fs::remove_dir_all(root);
     }
@@ -3476,6 +3647,11 @@ mod tests {
         assert!(skill.contains("stata-ai-skill config reset"));
         assert!(skill.contains("do not ask for another confirmation"));
         assert!(skill.contains("Do not use `aiskill setup, force` as a"));
+        assert!(skill.contains("references/windows-powershell-http.md"));
+        assert!(skill.contains("references/lianxh-search.md"));
+        assert!(skill.lines().count() < 500);
+        assert!(Path::new("skills/stata-ai-skill/references/windows-powershell-http.md").exists());
+        assert!(Path::new("skills/stata-ai-skill/references/lianxh-search.md").exists());
     }
 
     #[test]
@@ -3523,9 +3699,9 @@ mod tests {
     #[test]
     fn bundled_aiskill_command_has_no_saio_or_auxiliary_port_scan() {
         let ado = fs::read_to_string("stata/aiskill/aiskill.ado").unwrap();
-        assert_eq!(SKILL_VERSION, "v1.1");
-        assert!(ado.starts_with("*! version v1.1 "));
-        assert!(ado.contains("local client_version \"v1.1\""));
+        assert_eq!(SKILL_VERSION, "v1.2");
+        assert!(ado.starts_with("*! version v1.2 "));
+        assert!(ado.contains("local client_version \"v1.2\""));
         assert!(!ado.to_ascii_lowercase().contains("saio"));
         assert!(!ado.contains("16886"));
         assert!(!ado.contains("16895"));
@@ -3534,9 +3710,9 @@ mod tests {
             .contains("syntax [anything(name=command)] [, port"));
         assert!(ado.contains("127.0.0.1:19522"));
         let help = fs::read_to_string("stata/aiskill/aiskill.sthlp").unwrap();
-        assert!(help.contains("version v1.1"));
+        assert!(help.contains("version v1.2"));
         let skill = fs::read_to_string("skills/stata-ai-skill/SKILL.md").unwrap();
-        assert!(skill.contains("version: v1.1"));
+        assert!(skill.contains("version: v1.2"));
     }
 
     #[test]

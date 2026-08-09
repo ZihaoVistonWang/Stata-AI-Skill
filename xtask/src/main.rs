@@ -43,7 +43,10 @@ fn dist() -> Result<()> {
     }
 
     let (platform_dir, exe_name) = packaged_binary_name();
-    let source = root.join("target").join("release").join(exe_name);
+    let target_dir = env::var_os("CARGO_TARGET_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| root.join("target"));
+    let source = target_dir.join("release").join(exe_name);
     let dest_dir = root
         .join("skills")
         .join("stata-ai-skill")

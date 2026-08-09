@@ -1,6 +1,6 @@
 ---
 name: stata-ai-skill
-version: v1.1
+version: v1.2
 description: Run, configure, reset, or reconfigure Stata through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, econometrics workflows, switch the configured Stata installation, redo Skill setup, clear Stata AI Skill configuration, or search Stata articles and cookbook-style resources with lianxh. No VS Code, Node.js, or Python runtime is required on the user side.
 ---
 
@@ -333,50 +333,9 @@ curl.exe -s -X POST http://127.0.0.1:19522/execute `
 In all three cases, the service executes the do-file directly and applies `cwd`
 before the `do` command.
 
-### PowerShell Curl Notes
-
-In PowerShell, `curl.exe -d` with a JSON body containing double quotes is
-often mangled because PowerShell intercepts the quotes before they reach curl.
-The double quotes inside `-d '{"code":"..."}'` get stripped or misinterpreted.
-
-**Do NOT use inline JSON with curl.exe in PowerShell.** Instead, always write
-the JSON body to a temporary file and use `--data-binary @file`.
-
-**Critical:** PowerShell 5.1's `Out-File -Encoding utf8` writes a UTF-8 BOM
-(byte-order mark) that breaks JSON parsers (serde_json returns "expected value
-at line 1 column 1"). Use `[System.IO.File]::WriteAllText` with
-`[System.Text.UTF8Encoding]::new($false)` to write clean UTF-8 without BOM:
-
-```powershell
-# Correct — UTF-8 without BOM
-$body = '{"code":"display 2+2"}'
-[System.IO.File]::WriteAllText("$env:TEMP\stata_body.json", $body, [System.Text.UTF8Encoding]::new($false))
-curl.exe -s -X POST http://127.0.0.1:19522/execute `
-  -H "Content-Type: application/json" `
-  --data-binary "@$env:TEMP\stata_body.json"
-```
-
-`Invoke-RestMethod` in PowerShell 5.1 has similar encoding issues; prefer the
-file approach above.
-
-For multi-line Stata code, use a literal `\n` (backslash + n) inside the JSON
-string — the JSON parser will convert it to an actual newline:
-
-```powershell
-$body = '{"code":"sysuse auto, clear\nsummarize price mpg"}'
-[System.IO.File]::WriteAllText("$env:TEMP\stata_body.json", $body, [System.Text.UTF8Encoding]::new($false))
-curl.exe -s -X POST http://127.0.0.1:19522/execute `
-  -H "Content-Type: application/json" `
-  --data-binary "@$env:TEMP\stata_body.json"
-```
-
-On macOS/Linux (bash/zsh), inline JSON works as expected:
-
-```bash
-curl -s -X POST http://127.0.0.1:19522/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code":"display 2+2"}'
-```
+For additional PowerShell quoting, UTF-8 BOM, and multiline JSON guidance, read
+[`references/windows-powershell-http.md`](references/windows-powershell-http.md)
+when the active shell is Windows PowerShell.
 
 Response:
 
@@ -407,12 +366,20 @@ curl -s -X POST http://127.0.0.1:19522/execute \
   -d '{"cwd":"/Users/me/project","code":"use data/auto.dta, clear\nsummarize"}'
 ```
 
+### Timeout Recovery
+
+A timeout returns HTTP 408 and sends a Stata break signal. If the response says
+`Stata is still stopping`, `/status.busy` deliberately remains `true`; do not
+send another execution until it becomes `false`. Send `/break` again if needed,
+or call `/shutdown` and restart the service if Stata never finishes stopping.
+
 ### Graph Export
 
 The standalone service enables Stata graph capture with `quietly _gr_list on`
-after session initialization. If user code contains `graph export`,
-`. graph export`, or `quietly graph export`, the service parses the requested
-path and common options such as `replace` and `name(...)`.
+after session initialization. It recognizes `graph export` at its original
+position, including leading `.`, `quietly`/`qui`, `capture`/`cap`, and
+`noisily`/`noi` prefixes. It preserves `replace` and `name(...)`; bitmap
+`width(...)` and `height(...)` control the Rust-rendered output dimensions.
 
 Explicit SVG exports are executed safely and returned in the response
 `graphs` array:
@@ -422,9 +389,10 @@ Explicit SVG exports are executed safely and returned in the response
 ```
 
 PNG/JPG/JPEG exports are supported without asking Stata to write those formats
-directly. The standalone service exports SVG first, converts it with bundled
-Rust libraries, keeps the SVG path, and writes the requested bitmap path. For
-PNG requests, the `png` field contains the generated PNG path. For JPG/JPEG
+directly. At the same point in the user's code, the service exports SVG first,
+then converts it with bundled Rust libraries, keeps the SVG path, and writes
+the requested bitmap path. For PNG requests, the `png` field contains the
+generated PNG path. For JPG/JPEG
 requests, `png` remains `null` and the graph object includes `file` and
 `format` fields for the generated bitmap. Other unsafe bitmap formats such as
 TIF and TIFF are still rewritten to SVG and reported in `output`.
@@ -435,129 +403,11 @@ paths under `graphs`.
 
 ## Lianxh Search
 
-When the user needs Stata cookbook-style examples, command tutorials, or
-high-quality Stata articles, use the `lianxh` Stata command to search
-**Lianxh** (连享会, https://www.lianxh.cn/), a third-party website that
-publishes Stata tutorials, econometrics articles, and resource lists.
-
-### Limits
-
-Limit each user task to at most three `lianxh <keywords>, md` search queries to
-avoid excessive output and token use. `help lianxh_cn`, `help lianxh`, and an
-explicitly approved `ssc install lianxh` do not count toward this three-query
-search limit.
-
-### Installation
-
-Before the first `lianxh` search in a conversation, check whether the command
-is installed:
-
-```stata
-which lianxh
-```
-
-If Stata reports "command lianxh not found", stop before installing anything.
-Use the host agent's best available interactive confirmation mechanism to
-present a yes/no choice to the user. Prefer a structured approval or binary
-choice UI when available. If the host does not expose such a tool in the current
-mode, ask in ordinary chat and wait for an explicit user reply. Do not treat a
-general request to "test lianxh" as permission to install it.
-
-The prompt must explain what Lianxh is, why installing the command helps (it
-enables help files and structured search directly from Stata), and where it
-installs (SSC writes into the local Stata ado directory). The table below maps
-agent platforms to equivalent mechanisms:
-
-| Agent / Platform | Interactive prompt mechanism |
-|---|---|
-| **Claude Code** | `AskUserQuestion` tool — set `"header"` to `"Install lianxh?"`, provide two options: **安装 (Recommended)** and **跳过** |
-| **Codex (OpenAI)** | Use a structured approval/question tool if the current surface exposes one; otherwise ask in chat and wait |
-| **OpenCode** | Use CLI interactive input (`read` / prompt) or stop and ask in chat |
-| **Cline / Roo Code** | `ask_followup_question` tool with two options |
-| **Aider** | Architecture-level prompt via `/ask` or inline confirmation |
-| **GitHub Copilot Chat** | `followup` prompt with option array |
-| **Hermes** | Custom dialog tool — format as a structured binary choice |
-
-Use this fallback wording when no structured prompt tool is available:
-
-```text
-检测到 lianxh 未安装。
-
-lianxh 是连享会提供的第三方 Stata 命令。安装后会写入本机 Stata ado 目录，
-用于通过 Stata 检索连享会文章、教程和资源列表。
-
-是否允许安装 lianxh？
-- 安装：运行 ssc install lianxh，然后继续测试/检索
-- 跳过：不修改 Stata ado 环境，并跳过 lianxh 检索
-```
-
-Only if the user explicitly agrees, run:
-
-```stata
-ssc install lianxh
-```
-
-Then proceed with the help and search steps below. If the user declines, skip
-`lianxh`-based search and continue with available local context.
-
-### Help
-
-After confirming `lianxh` is installed, inspect the help file to confirm
-command syntax and available filters:
-
-```stata
-help lianxh_cn
-```
-
-If Chinese help is not suitable for the conversation, or if it is unavailable,
-use:
-
-```stata
-help lianxh
-```
-
-### Search
-
-Use the `lianxh` command with Markdown output so article titles and links are
-easy to inspect:
-
-```stata
-lianxh 关键词1 关键词2 关键词3, md
-```
-
-- Prefer Chinese search keywords when they fit the user's topic.
-- Run no more than three search commands for the task.
-- Treat the Markdown list returned by `lianxh ..., md` as candidate references.
-- Use the article titles and `https://www.lianxh.cn/` links to decide which
-  resources are relevant before summarizing or citing them.
-
-If installation or search fails because Stata cannot reach the network, report
-the error to the user and continue with available local context.
-
-### Timeout
-
-A timed-out `lianxh` execution returns HTTP 408 with:
-
-```json
-{"success":false,"returnCode":-1,"output":"Execution timed out after 3s","error":"Execution timed out after 3s","graphs":[]}
-```
-
-### Session Recovery After Timeout
-
-After a timeout kills execution, the Stata session may briefly be in a
-recovering state. The **first** execution immediately after a timeout may
-return a stale timeout error even though Stata completed. Always verify by
-running a trivial command after timeout:
-
-```bash
-curl -s -X POST http://127.0.0.1:19522/execute \
-  -H "Content-Type: application/json" \
-  -d '{"code":"display 123"}'
-```
-
-If it returns `success: true`, the session is healthy. If it returns another
-timeout error, check `/status` and retry once more. The service itself does
-not crash on timeout.
+When the user asks for Stata cookbook examples, command tutorials, or Lianxh
+articles, read and follow
+[`references/lianxh-search.md`](references/lianxh-search.md). It contains the
+installation-consent boundary, three-query limit, search syntax, and timeout
+recovery workflow.
 
 ## Break And Shutdown
 
