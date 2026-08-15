@@ -1,0 +1,32 @@
+# stata-ai-skill bundle patch: starts the Stata AI Skill native service
+# together with the DeepSeek Harness process, stops it on shutdown, and
+# registers the bundled skill (SKILL.md) so the plugin is fully usable
+# without any manual skill installation.
+- insert:
+    # Service lifecycle plugin row.
+    - id: stata-ai-skill
+      name: '@zihaovistonwang/stata-ai-skill'
+      config:
+        # Port the Stata AI Skill service listens on (default 19522).
+        port: 19522
+        # Explicit path to the stata-ai-skill executable. When omitted, the
+        # plugin resolves the packaged binary inside the bundled skill
+        # (skills/stata-ai-skill/bin/<platform>/), then $STATA_AI_SKILL_BIN,
+        # then PATH.
+        binPath: null
+        # Seconds to wait for the service to come online after spawning it.
+        startTimeoutMs: 30000
+        # Restart the service if it exits unexpectedly (max consecutive restarts).
+        maxRestarts: 5
+        # Base backoff in ms between restarts (doubles each attempt).
+        restartBackoffMs: 1000
+
+    # Bundled-skill provider: exposes the packaged SKILL.md to the DSH skill
+    # registry by resolving the installed npm identity from the profile's
+    # loader baseUrl — never a path concatenated onto baseUrl.
+    - id: stata-ai-skill-filesystem
+      name: '@deepseek-ai/dsh-skill-filesystem'
+      config:
+        providerName: stata-ai-skill-plugin
+        includeDefaultRoots: false
+        bundledSkillDir: !!js process.getBuiltinModule('node:path').join(process.getBuiltinModule('node:path').dirname(process.getBuiltinModule('node:module').createRequire(baseUrl).resolve('@zihaovistonwang/stata-ai-skill/package.json')), 'skills')

@@ -1,0 +1,46 @@
+{
+  "name": "@zihaovistonwang/stata-ai-skill",
+  "description": "Start the native Stata AI Skill service together with DeepSeek Harness — platform-aware (macOS arm64 / Windows x64 / Windows arm64), reuses an already-running service, restarts on crash, and shuts down cleanly with DSH.",
+  "version": "1.2.0",
+  "type": "module",
+  "main": "lib/index.js",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZihaoVistonWang/Stata-AI-Skill.git",
+    "directory": "dsh-plugin"
+  },
+  "keywords": [
+    "deepseek",
+    "harness",
+    "dsh",
+    "dsh-plugin",
+    "stata",
+    "econometrics",
+    "skill"
+  ],
+  "engines": {
+    "node": ">=18"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "exports": {
+    ".": "./lib/index.js",
+    "./cordis.patch.yml": "./cordis.patch.yml",
+    "./package.json": "./package.json"
+  },
+  "files": [
+    "lib",
+    "skills",
+    "test",
+    "cordis.patch.yml",
+    "LICENSE",
+    "README.md"
+  ],
+  "publishConfig": {
+    "access": "public"
+  }
+}
