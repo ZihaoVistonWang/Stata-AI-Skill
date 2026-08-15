@@ -2,6 +2,8 @@
 
 [![skills.sh](https://skills.sh/b/ZihaoVistonWang/Stata-AI-Skill)](https://skills.sh/ZihaoVistonWang/Stata-AI-Skill)
 
+🐳 DeepSeek Hermes is now compatible — see the [dsh-plugin](https://github.com/ZihaoVistonWang/Stata-AI-Skill/tree/main/dsh-plugin) directory for details.
+
 Native localhost HTTP service that lets AI agents run Stata without VS Code,
 Node.js, or Python on the user side.
 
@@ -89,6 +91,28 @@ Extract the ZIP file and detect the Skills installation directory used by each A
 If multiple Agents share the same universal Skills directory, do not create unnecessary duplicate copies. If installation fails for one Agent, continue installing for the others.
 
 After installation, locate and read the installed `SKILL.md` file before using the Skill.
+
+### Install With DeepSeek Harness (DSH)
+
+Install `Node.js`, then install the DeepSeek Harness (DSH) globally:
+
+```bash
+npm install -g @deepseek-ai/dsh
+```
+
+Run the following command from any directory (omitting the version installs the latest):
+
+```bash
+dsh plugin --profile web add @zihaovistonwang/stata-ai-skill
+```
+
+This installs the package into `~/.dsh/profiles/web/node_modules` and automatically adds `@zihaovistonwang/stata-ai-skill` to the `dsh.profile.bundles` layer. Then restart DSH Web:
+
+```bash
+dsh web
+```
+
+For more details (platform-aware binaries, reusing an existing service, configuration, local development install, etc.), see the [dsh-plugin directory](https://github.com/ZihaoVistonWang/Stata-AI-Skill/tree/main/dsh-plugin).
 
 ## Quick Start
 
