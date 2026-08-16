@@ -1,6 +1,13 @@
-# Stata AI Skill Native Service
+<h1 align="center">
+<b>Stata AI Skill Native Service</b>
+</h1>
 
-[![skills.sh](https://skills.sh/b/ZihaoVistonWang/Stata-AI-Skill)](https://skills.sh/ZihaoVistonWang/Stata-AI-Skill)
+<p align="center">
+   <a href="https://www.skills.sh/zihaovistonwang/stata-ai-skill/stata-ai-skill"><img src="https://skills.sh/b/ZihaoVistonWang/Stata-AI-Skill" alt="skills.sh"></a>
+   <a href="https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases"><img src="https://img.shields.io/github/downloads/ZihaoVistonWang/Stata-AI-Skill/total?logo=github&label=GitHub%20downloads&color=%238be9fd" alt="GitHub Downloads (all assets, all releases)"></a>
+   <a href="https://awesome-dsh-plugin.com/p/ZihaoVistonWang/Stata-AI-Skill/"><img src="https://awesome-dsh-plugin.com/badge.svg" alt="Awesome DSH Plugin"></a>
+</p>
+
 
 <h3 align="center">
 <b>🐳 DeepSeek Hermes is now compatible</b> </br>See the <a href="https://github.com/ZihaoVistonWang/Stata-AI-Skill/tree/main/dsh-plugin">dsh-plugin</a> directory for details.
@@ -42,6 +49,9 @@ skills/
         aiskill.sthlp
         aiskill.pkg
         stata.toc
+    references/
+      lianxh-search.md
+      windows-powershell-http.md
 ```
 
 Agents should resolve the executable from
