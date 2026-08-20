@@ -96,7 +96,7 @@ After installation, locate and read the installed `SKILL.md` file before using t
 
 ### Install with ZIP File
 
-Download `stata-ai-skill-v1.2.zip` from either the [China download link](https://gitee.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.2/stata-ai-skill-v1.2.zip) or the [international download link](https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.2/stata-ai-skill-v1.2.zip).
+Download `stata-ai-skill-v1.3.zip` from either the [China download link](https://gitee.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.3/stata-ai-skill-v1.3.zip) or the [international download link](https://github.com/ZihaoVistonWang/Stata-AI-Skill/releases/download/v1.3/stata-ai-skill-v1.3.zip).
 
 Extract the ZIP file and detect the Skills installation directory used by each Agent installed or configured on the local system. Copy the entire `stata-ai-skill` folder into as many applicable Agent Skills directories as possible, replacing any existing version while preserving the original folder structure.
 
@@ -159,7 +159,8 @@ The running service saves the choice and initializes Stata without a restart.
 
 If discovery finds no candidate, `/status` returns
 `setup.phase: "manual_setup_required"`. The agent immediately creates an
-installation session and gives the user ``do "`c(tmpdir)'/installation.do"``.
+installation session and gives the user a `do` command containing the actual
+absolute path of the generated `installation.do` file.
 Running that command in the selected GUI Stata installs `aiskill` according to
 that Stata user's own ado-path configuration. The 19522 service waits for the
 `/installed` callback and then asks the user to run `aiskill setup`. No

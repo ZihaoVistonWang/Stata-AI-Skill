@@ -17,7 +17,7 @@ use encoding_rs::{BIG5, EUC_KR, GBK, SHIFT_JIS, WINDOWS_1252};
 use serde_json::{json, Value};
 
 const SERVICE_NAME: &str = "stata-ai-skill";
-const SKILL_VERSION: &str = "v1.2";
+const SKILL_VERSION: &str = "v1.3";
 const DEFAULT_PORT: u16 = 19522;
 const DEFAULT_TIMEOUT_SEC: u64 = 30;
 const MAX_TIMEOUT_SEC: u64 = 600;
@@ -1456,10 +1456,8 @@ fn install_session_json(state: &AppState) -> (u16, String) {
         Err(_) => return (500, json_error("runtime state is unavailable")),
     };
     let installation_path = env::temp_dir().join("installation.do");
-    let package_path = package
-        .to_string_lossy()
-        .replace('\\', "/")
-        .replace('"', "\"\"");
+    let installation_command_path = stata_forward_slash_path(&installation_path.to_string_lossy());
+    let package_path = stata_forward_slash_path(&package.to_string_lossy());
     let script = format!(
         "tempfile __aiskill_install_response\ncapture noisily net install aiskill, from(\"{package_path}\") replace\nlocal __aiskill_install_rc = _rc\nif `__aiskill_install_rc' == 0 {{\n    capture quietly copy \"http://127.0.0.1:{port}/installed?aiskill=1&token={token}\" \"`__aiskill_install_response'\", replace\n}}\nelse {{\n    capture quietly copy \"http://127.0.0.1:{port}/installed?aiskill=0&token={token}\" \"`__aiskill_install_response'\", replace\n}}\n"
     );
@@ -1482,7 +1480,7 @@ fn install_session_json(state: &AppState) -> (u16, String) {
         json!({
             "success": true,
             "phase": "awaiting_install_result",
-            "command": "do \"`c(tmpdir)'/installation.do\"",
+            "command": format!("do \"{installation_command_path}\""),
             "installationDo": installation_path.to_string_lossy(),
             "expiresSeconds": SETUP_TOKEN_TTL.as_secs()
         })
@@ -3144,6 +3142,10 @@ fn escape_stata_path(path: &str) -> String {
     path.replace('\\', "\\\\").replace('"', "\"\"")
 }
 
+fn stata_forward_slash_path(path: &str) -> String {
+    path.replace('\\', "/").replace('"', "\"\"")
+}
+
 fn unique_id() -> String {
     let millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -3669,7 +3671,12 @@ mod tests {
         assert_eq!(status, 200);
         let response: Value = serde_json::from_str(&body).unwrap();
         assert_eq!(response["phase"], "awaiting_install_result");
-        assert_eq!(response["command"], "do \"`c(tmpdir)'/installation.do\"");
+        let installation_do = response["installationDo"].as_str().unwrap();
+        assert_eq!(
+            response["command"],
+            format!("do \"{}\"", installation_do.replace('\\', "/"))
+        );
+        assert!(!response["command"].as_str().unwrap().contains("c(tmpdir)"));
         let token = state
             .setup
             .lock()
@@ -3695,6 +3702,16 @@ mod tests {
     }
 
     #[test]
+    fn installation_command_normalizes_an_absolute_windows_path() {
+        let path = stata_forward_slash_path(r#"D:\stata17\temp\installation.do"#);
+        assert_eq!(path, "D:/stata17/temp/installation.do");
+        assert_eq!(
+            format!("do \"{path}\""),
+            "do \"D:/stata17/temp/installation.do\""
+        );
+    }
+
+    #[test]
     fn decodes_utf8_and_gbk_setup_paths() {
         assert_eq!(
             query_value("sysdirStata=C%3A%5CStata+19", "sysdirStata").as_deref(),
@@ -3707,9 +3724,9 @@ mod tests {
     #[test]
     fn bundled_aiskill_command_has_no_saio_or_auxiliary_port_scan() {
         let ado = fs::read_to_string("stata/aiskill/aiskill.ado").unwrap();
-        assert_eq!(SKILL_VERSION, "v1.2");
-        assert!(ado.starts_with("*! version v1.2 "));
-        assert!(ado.contains("local client_version \"v1.2\""));
+        assert_eq!(SKILL_VERSION, "v1.3");
+        assert!(ado.starts_with("*! version v1.3 "));
+        assert!(ado.contains("local client_version \"v1.3\""));
         assert!(!ado.to_ascii_lowercase().contains("saio"));
         assert!(!ado.contains("16886"));
         assert!(!ado.contains("16895"));
@@ -3718,9 +3735,9 @@ mod tests {
             .contains("syntax [anything(name=command)] [, port"));
         assert!(ado.contains("127.0.0.1:19522"));
         let help = fs::read_to_string("stata/aiskill/aiskill.sthlp").unwrap();
-        assert!(help.contains("version v1.2"));
+        assert!(help.contains("version v1.3"));
         let skill = fs::read_to_string("skills/stata-ai-skill/SKILL.md").unwrap();
-        assert!(skill.contains("version: v1.2"));
+        assert!(skill.contains("version: v1.3"));
     }
 
     #[test]

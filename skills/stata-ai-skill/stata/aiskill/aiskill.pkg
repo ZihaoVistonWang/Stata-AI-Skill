@@ -1,7 +1,7 @@
 v 3
 d aiskill - Configure Stata AI Skill from Stata
-d Version: v1.2
-d Distribution-Date: 20260809
+d Version: v1.3
+d Distribution-Date: 20260820
 d Requires: Stata version 13 or newer
 f aiskill.ado
 f aiskill.sthlp

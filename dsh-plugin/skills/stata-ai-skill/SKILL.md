@@ -1,6 +1,6 @@
 ---
 name: stata-ai-skill
-version: v1.2
+version: v1.3
 description: Run, configure, reset, or reconfigure Stata through the native Stata AI Skill background service at http://127.0.0.1:19522. Use when the user asks to run Stata commands, regressions, summarize data, t tests, hypothesis tests, do-files, .do scripts, .dta datasets, econometrics workflows, switch the configured Stata installation, redo Skill setup, clear Stata AI Skill configuration, or search Stata articles and cookbook-style resources with lianxh. No VS Code, Node.js, or Python runtime is required on the user side.
 ---
 
@@ -215,10 +215,11 @@ session:
 curl -s -X POST http://127.0.0.1:19522/setup/install-session
 ```
 
-Copy or display the returned `command`, normally:
+Copy or display the returned `command` exactly. It contains the absolute path
+of the generated script, for example:
 
 ```stata
-do "`c(tmpdir)'/installation.do"
+do "D:/path/to/the/system/temp/directory/installation.do"
 ```
 
 Tell the user to run this command in the specific GUI Stata installation they
