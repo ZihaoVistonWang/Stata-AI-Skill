@@ -157,7 +157,7 @@ impl AppPaths {
                     .join("stata-ai-skill")
                     .join("graphs"),
                 config_dir,
-            });
+            })
         }
     }
 
@@ -335,6 +335,18 @@ fn discover_stata(configured: Option<&Path>) -> Discovery {
 }
 
 fn resolve_from_user_path(path: &Path) -> Vec<DiscoveryCandidate> {
+    #[cfg(target_os = "linux")]
+    {
+        if path.is_dir() {
+            return linux_candidates(path, "configured");
+        }
+        if let Some(name @ ("stata" | "stata-se" | "stata-mp")) = path.file_name().and_then(|v| v.to_str()) {
+            return resolve_from_user_path(&path.with_file_name(format!("lib{name}.so")));
+        }
+        if !path.is_file() { return Vec::new(); }
+    }
+    #[cfg(target_os = "linux")]
+    if !matches!(path.file_name().and_then(|s| s.to_str()), Some("libstata.so" | "libstata-se.so" | "libstata-mp.so")) { return Vec::new(); }
     if is_library_path(path) {
         return vec![candidate_from_library(
             path.to_path_buf(),
@@ -413,6 +425,7 @@ fn edition_from_library(path: &Path) -> String {
         .and_then(|value| value.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
+    if name == "libstata.so" { return "be".into(); }
     for edition in ["mp", "se", "be", "ic"] {
         if name.contains(&format!("-{edition}."))
             || name.starts_with(&format!("{edition}-"))
@@ -424,7 +437,7 @@ fn edition_from_library(path: &Path) -> String {
     String::new()
 }
 
-#[cfg(target_os = "macos")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn parse_numeric_version(values: &[&str]) -> Option<u32> {
     for value in values {
         let lower = value.to_ascii_lowercase();
@@ -762,7 +775,40 @@ fn windows_libraries_in(dir: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+#[cfg(target_os = "linux")]
+fn linux_candidates(dir: &Path, source: &str) -> Vec<DiscoveryCandidate> {
+    ["libstata-mp.so", "libstata-se.so", "libstata.so"].iter()
+        .map(|name| dir.join(name))
+        .filter(|lib| lib.is_file())
+        .map(|lib| {
+            let mut candidate = candidate_from_library(lib.clone(), lib, source);
+            candidate.version = parse_numeric_version(&[&dir.to_string_lossy()]);
+            candidate.display_name = candidate_display_name(dir, candidate.version, &candidate.edition);
+            candidate
+        }).collect()
+}
+
+#[cfg(target_os = "linux")]
+fn scan_installations() -> (Vec<DiscoveryCandidate>, Option<String>) {
+    let mut roots = vec![PathBuf::from("/usr/local"), PathBuf::from("/opt")];
+    if let Ok(home) = home_dir() {
+        roots.push(home.join(".local/opt"));
+        roots.push(home);
+    }
+    let mut candidates = Vec::new();
+    for root in roots {
+        if let Ok(entries) = fs::read_dir(root) {
+            for entry in entries.flatten() {
+                if entry.file_name().to_string_lossy().to_ascii_lowercase().starts_with("stata") {
+                    candidates.extend(linux_candidates(&entry.path(), "scan"));
+                }
+            }
+        }
+    }
+    (candidates, None)
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows", target_os = "linux")))]
 fn scan_installations() -> (Vec<DiscoveryCandidate>, Option<String>) {
     (
         Vec::new(),
@@ -919,6 +965,9 @@ fn handle_connection(mut stream: TcpStream, state: Arc<AppState>) -> Result<()> 
         .map(|(name, value)| (name.trim().to_ascii_lowercase(), value.trim().to_string()))
         .collect::<std::collections::HashMap<_, _>>();
 
+    if let Err(error) = validate_setup_headers(&headers, &state) {
+        return write_response(&mut stream, 403, &json_error(&error));
+    }
     let (status, response, content_type) = match (method, path) {
         ("GET", "/status") if query_value(query, "format").as_deref() == Some("stata") => {
             (200, status_stata_text(&state), "text/plain; charset=utf-8")
@@ -2779,6 +2828,13 @@ impl NativeApi {
 
     fn init(&self, library_path: &Path) -> Result<()> {
         set_stata_environment(library_path);
+        #[cfg(target_os = "linux")]
+        let mut args = {
+            let lib = library_path.file_stem().and_then(|s| s.to_str()).unwrap_or("libstata");
+            let exe = library_path.with_file_name(lib.trim_start_matches("lib"));
+            vec![CString::new(exe.as_os_str().as_encoded_bytes()).map_err(|e| e.to_string())?, CString::new("-q").unwrap()]
+        };
+        #[cfg(not(target_os = "linux"))]
         let mut args = init_args();
         let mut argv: Vec<*mut c_char> = args
             .iter_mut()
@@ -2997,6 +3053,7 @@ fn expected_license_path(library_path: &Path) -> Option<PathBuf> {
     Some(home.join("stata.lic"))
 }
 
+#[cfg(not(target_os = "linux"))]
 fn init_args() -> Vec<CString> {
     #[cfg(target_os = "windows")]
     {
