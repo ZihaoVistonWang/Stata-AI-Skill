@@ -154,6 +154,10 @@ fn packaged_binary_name() -> (&'static str, &'static str) {
     } else if cfg!(target_os = "macos") {
         ("macos-arm64", "stata-ai-skill")
     } else {
-        ("unix", "stata-ai-skill")
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            ("linux-x64", "stata-ai-skill")
+        } else {
+            ("unix", "stata-ai-skill")
+        }
     }
 }

@@ -6,7 +6,7 @@ description: Run, configure, reset, or reconfigure Stata through the native Stat
 
 # Stata AI Skill
 
-Requires Apple Silicon macOS or Windows, the native `stata-ai-skill`
+Requires Linux x86_64, Apple Silicon macOS, or Windows, the native `stata-ai-skill`
 executable, and a locally installed/licensed Stata. Intel Mac is not
 supported. If automatic Stata discovery fails, use the agent-guided two-stage
 `aiskill setup` fallback on the same localhost service port.
@@ -51,7 +51,9 @@ stata-ai-skill/
 Resolution order:
 
 1. If `STATA_AI_SKILL_BIN` is set, use that exact executable path.
-2. macOS Apple Silicon: use `<this-skill-directory>/bin/macos-arm64/stata-ai-skill`.
+2. Linux x86_64: use `<this-skill-directory>/bin/linux-x64/stata-ai-skill`. Build the executable with `cargo run -p xtask -- dist` from the source checkout if it is absent. Start it with the `serve` argument. Check HTTP /status and follow the setup phase below.
+
+   macOS Apple Silicon: use `<this-skill-directory>/bin/macos-arm64/stata-ai-skill`.
 3. macOS Intel (`x86_64`): stop and tell the user this skill does not support Intel Mac.
 4. macOS Apple Silicon fallback: use `<this-skill-directory>/bin/macos/stata-ai-skill`.
 5. Windows x64: use `<this-skill-directory>\bin\windows\stata-ai-skill.exe`.
